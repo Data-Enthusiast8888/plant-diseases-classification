@@ -1,0 +1,15 @@
+# FastAPI Backend Requirements
+fastapi
+uvicorn[standard]
+python-multipart
+tensorflow
+#tensorflow-cpu for CPU-only
+Pillow
+numpy
+
+# Optional: for better performance
+gunicorn
+
+# Additional useful packages
+python-jose[cryptography]==3.3.0  # for JWT tokens if needed
+passlib[bcrypt]==1.7.4            # for password hashing if needed
