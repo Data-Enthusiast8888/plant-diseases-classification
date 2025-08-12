@@ -1,8 +1,19 @@
+# streamlit
+# streamlit-option-menu
+# opencv-python
+# speechrecognition
+# requests
+# numpy
+# Pillow
+# matplotlib
+
 streamlit
 streamlit-option-menu
-opencv-python
-speechrecognition
 requests
 numpy
-Pillow
+pandas
 matplotlib
+plotly
+Pillow
+opencv-python
+speechrecognition
