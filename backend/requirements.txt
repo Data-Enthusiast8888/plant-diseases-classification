@@ -7,7 +7,7 @@ tensorflow
 Pillow
 numpy
 streamlit-option-menu
-
+streamlit
 # Optional: for better performance
 gunicorn
 
