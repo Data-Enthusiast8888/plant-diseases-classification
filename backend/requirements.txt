@@ -6,6 +6,7 @@ tensorflow
 #tensorflow-cpu for CPU-only
 Pillow
 numpy
+streamlit-option-menu
 
 # Optional: for better performance
 gunicorn
