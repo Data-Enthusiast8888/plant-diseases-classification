@@ -5,3 +5,4 @@ speechrecognition
 requests
 numpy
 Pillow
+matplotlib
