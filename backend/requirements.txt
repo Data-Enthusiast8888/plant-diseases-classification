@@ -3,12 +3,10 @@ fastapi
 uvicorn[standard]
 python-multipart
 tensorflow
-#tensorflow-cpu for CPU-only
 Pillow
 numpy
 streamlit-option-menu
 streamlit
-# Optional: for better performance
 gunicorn
 
 # Additional useful packages

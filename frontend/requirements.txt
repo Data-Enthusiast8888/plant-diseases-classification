@@ -1,0 +1,7 @@
+streamlit
+streamlit-option-menu
+opencv-python
+speechrecognition
+requests
+numpy
+Pillow
