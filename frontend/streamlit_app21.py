@@ -2481,21 +2481,21 @@ def severity_badge(severity):
     }
     return badges.get(severity, '<span class="severity-none">✅ Healthy</span>')
 
-def set_background_local(image_file):
-    with open(image_file, "rb") as file:
-        encoded = base64.b64encode(file.read()).decode()
-    st.markdown(
-        f"""
-        <style>
-        .stApp {{
-            background-image: url("data:image/jpeg;base64,{encoded}");
-            background-size: cover;
-            background-position: center;
-            background-repeat: no-repeat;
-            background-attachment: fixed;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-set_background_local("plant_disease_classification.png")  # Replace with your actual filename
+# def set_background_local(image_file):
+#     with open(image_file, "rb") as file:
+#         encoded = base64.b64encode(file.read()).decode()
+#     st.markdown(
+#         f"""
+#         <style>
+#         .stApp {{
+#             background-image: url("data:image/jpeg;base64,{encoded}");
+#             background-size: cover;
+#             background-position: center;
+#             background-repeat: no-repeat;
+#             background-attachment: fixed;
+#         }}
+#         </style>
+#         """,
+#         unsafe_allow_html=True
+#     )
+# set_background_local("plant_disease_classification.png")  # Replace with your actual filename
