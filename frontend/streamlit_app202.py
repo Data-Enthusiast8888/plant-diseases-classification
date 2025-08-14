@@ -822,7 +822,7 @@ elif selected_page == current_texts["plant_doctor"]:
         if uploaded_file:
             # Display uploaded image
             image = Image.open(uploaded_file)
-            st.image(image, caption="📸 Plant Photo for Analysis", use_column_width=True)
+            st.image(image, caption="📸 Plant Photo for Analysis", use_container_width=True)
             
             # Analysis button
             if st.button(current_texts["analyze_plant"], type="primary", use_container_width=True):
