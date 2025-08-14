@@ -9,6 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from PIL import Image
 import io
+import os
 import json
 import base64
 from datetime import datetime, timedelta
@@ -32,7 +33,8 @@ st.set_page_config(
 )
 
 # ===== CONFIGURATION =====
-FASTAPI_BASE_URL = "http://127.0.0.1:8000"
+#FASTAPI_BASE_URL = "http://127.0.0.1:8000"
+FASTAPI_BASE_URL = os.getenv("FASTAPI_URL", "http://127.0.0.1:8000")
 FASTAPI_ENDPOINTS = {
     "health": f"{FASTAPI_BASE_URL}/health",
     "predict": f"{FASTAPI_BASE_URL}/predict",
@@ -426,6 +428,9 @@ def apply_enhanced_css():
         .kenyan-card { padding: 1rem !important; margin: 0.5rem 0 !important; }
         .stButton>button { padding: 0.6rem 1.5rem !important; font-size: 0.9rem !important; }
         .analysis-card { padding: 1rem !important; }
+        .css-1d391kg { width: 100% !important; }
+        .stSelectbox { margin-bottom: 1rem; }
+    
     }
     
     /* Sidebar styling */
@@ -599,13 +604,14 @@ st.session_state.api_status = 'online' if api_connected else 'offline'
 
 # ===== SIDEBAR =====
 with st.sidebar:
-    # Language selection
-    st.session_state.selected_language = st.selectbox(
-        "🌍 Language / Lugha / Dhok",
-        options=list(LANGUAGES.keys()),
-        index=list(LANGUAGES.keys()).index(st.session_state.selected_language)
-    )
     
+    st.session_state.selected_language = st.selectbox(
+    "🌍 Language / Lugha / Dhok",
+    options=list(LANGUAGES.keys()),
+    index=list(LANGUAGES.keys()).index(st.session_state.selected_language),
+    key="language_selector"  # ADD THIS
+)
+
     current_texts = UI_TEXTS.get(st.session_state.selected_language, UI_TEXTS["English"])
     
     st.markdown(f"""
@@ -820,6 +826,14 @@ elif selected_page == current_texts["plant_doctor"]:
             
             # Analysis button
             if st.button(current_texts["analyze_plant"], type="primary", use_container_width=True):
+                try:
+                    img_array = np.array(image)
+                    if img_array.mean() < 10 or img_array.mean() > 245:  # Too dark/bright
+                        st.error("❌ Image quality too poor for analysis")
+                        st.stop()
+                except:
+                    st.error("❌ Invalid image format")
+                    st.stop()
                 # Generate analysis ID
                 analysis_id = str(uuid.uuid4())[:8]
                 st.session_state.current_analysis_id = analysis_id
@@ -881,7 +895,11 @@ elif selected_page == current_texts["plant_doctor"]:
                 
                 if confidence <= 1:
                     confidence *= 100
-                
+
+                if confidence < 60:  # Set minimum confidence threshold
+                    st.warning("⚠️ Low confidence detection. Please ensure image shows clear plant leaves.")
+                    result["predicted_class"] = "uncertain_detection"
+                                
                 disease_info = PLANT_DISEASES.get(predicted_class, {})
                 
                 st.markdown("---")
