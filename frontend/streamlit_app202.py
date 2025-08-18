@@ -38,22 +38,45 @@ st.set_page_config(
 #FASTAPI_BASE_URL = os.getenv("FASTAPI_URL", "http://127.0.0.1:8000")
 
 
-def get_local_ip():
-    """Get local network IP address"""
+# At the top of your script, add:
+
+#os.environ["FASTAPI_PUBLIC_URL"] = "https://your-ngrok-url.ngrok.io"  # or your public IP
+os.environ["FASTAPI_PUBLIC_URL"] = "http://203.0.113.1:8000"
+
+def get_api_url():
+    """Get FastAPI URL with fallback options"""
+    # Priority order: Environment variable, public IP, local IP, localhost
+    if os.getenv("FASTAPI_URL"):
+        return os.getenv("FASTAPI_URL")
+    
+    # For production/public deployment
+    if os.getenv("FASTAPI_PUBLIC_URL"):
+        return os.getenv("FASTAPI_PUBLIC_URL")
+    
+    # Try local network IP
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        local_ip = s.getsockname()[0]
         s.close()
-        return ip
+        return f"http://{local_ip}:8000"
+    except:
+        return "http://127.0.0.1:8000"
+
+FASTAPI_BASE_URL = get_api_url()
+
+
+def get_local_ip():
+    """Get local IP address"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
     except:
         return "127.0.0.1"
-
-# Use network IP instead of localhost for mobile access
-LOCAL_IP = get_local_ip()
-FASTAPI_BASE_URL = os.getenv("FASTAPI_URL", f"http://{LOCAL_IP}:8000")
-
-
+    
 
 FASTAPI_ENDPOINTS = {
     "health": f"{FASTAPI_BASE_URL}/health",
@@ -140,40 +163,43 @@ def translate_text_simple(text, target_lang):
     return text
 
 # ===== API FUNCTIONS =====
-# @st.cache_data(ttl=30)
+# @st.cache_data(ttl=10)
 # def check_fastapi_connection(timeout=5):
-#     """Check FastAPI connection with caching"""
+#     """Check FastAPI connection (online first, fallback only if offline)"""
 #     try:
 #         resp = requests.get(f"{FASTAPI_BASE_URL}/health", timeout=timeout)
 #         if resp.status_code == 200:
+#             # Cache model info once if available
+#             if 'model_cached' not in st.session_state:
+#                 cache_model_offline()
 #             return True, safe_json(resp)
 #         return False, safe_json(resp)
 #     except Exception as e:
 #         return False, {"error": str(e)}
-
-# Replace check_fastapi_connection function:
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def check_fastapi_connection(timeout=5):
-    """Check FastAPI connection with caching and fallback"""
-    try:
-        resp = requests.get(f"{FASTAPI_BASE_URL}/health", timeout=timeout)
-        if resp.status_code == 200:
-            # Cache successful connection
-            if 'model_cached' not in st.session_state:
-                cache_model_offline()
-            return True, safe_json(resp)
-        else:
-            # Try caching on connection failure
-            if 'offline_cache_attempted' not in st.session_state:
-                st.session_state.offline_cache_attempted = True
-                cache_model_offline()
-            return False, safe_json(resp)
-    except Exception as e:
-        # Try caching on first failure
-        if 'offline_cache_attempted' not in st.session_state:
-            st.session_state.offline_cache_attempted = True
-            cache_model_offline()
-        return False, {"error": str(e), "using_cache": True}
+    """Check FastAPI connection with multiple fallback URLs"""
+    urls_to_try = [
+        FASTAPI_BASE_URL,
+        os.getenv("FASTAPI_PUBLIC_URL", ""),
+        "http://127.0.0.1:8000",
+        f"http://{get_local_ip()}:8000"
+    ]
+    
+    for url in urls_to_try:
+        if not url:
+            continue
+        try:
+            resp = requests.get(f"{url}/health", timeout=timeout)
+            if resp.status_code == 200:
+                # Return the working URL along with success status
+                if 'model_cached' not in st.session_state:
+                    cache_model_offline()
+                return True, safe_json(resp), url
+        except Exception:
+            continue
+    
+    return False, {"error": "All connection attempts failed"}, None
 
 def predict_with_fastapi(file_obj, timeout=25):
     """Send image to FastAPI for prediction"""
@@ -712,22 +738,36 @@ def apply_enhanced_css():
 apply_enhanced_css()
 
 # ===== MAIN APPLICATION =====
-# Check API status
 
-api_connected, api_info = check_fastapi_connection()
-has_cache = st.session_state.get('model_cached', False)
-st.session_state.api_status = 'online' if api_connected else ('cached' if has_cache else 'offline')
+# Check API status
+api_connected, api_info, working_url = check_fastapi_connection()
+
+# Update the working URL if found
+if working_url:
+    FASTAPI_BASE_URL = working_url
+    # Update all endpoints with the new base URL
+    FASTAPI_ENDPOINTS = {
+        "health": f"{FASTAPI_BASE_URL}/health",
+        "predict": f"{FASTAPI_BASE_URL}/predict",
+        "batch_predict": f"{FASTAPI_BASE_URL}/batch_predict",
+        "model_info": f"{FASTAPI_BASE_URL}/model/info"
+    }
 
 # ===== SIDEBAR =====
 with st.sidebar:
     
+#     st.session_state.selected_language = st.selectbox(
+#     "🌍 Language / Lugha / Dhok",
+#     options=list(LANGUAGES.keys()),
+#     index=list(LANGUAGES.keys()).index(st.session_state.selected_language),
+#     key="language_selector"  # ADD THIS
+# )
     st.session_state.selected_language = st.selectbox(
-    "🌍 Language / Lugha / Dhok",
+    "🌐 Language / Lugha / Dhok",
     options=list(LANGUAGES.keys()),
-    index=list(LANGUAGES.keys()).index(st.session_state.selected_language),
-    key="language_selector"  # ADD THIS
+    index=list(LANGUAGES.keys()).index(st.session_state.selected_language)
 )
-
+    
     current_texts = UI_TEXTS.get(st.session_state.selected_language, UI_TEXTS["English"])
     
     st.markdown(f"""
@@ -764,23 +804,42 @@ with st.sidebar:
     )
     
     # System Status
-    st.markdown("---")
+    # st.markdown("---")
     
+    # if api_connected:
+    #     api_status_color = "status-online"
+    #     api_status_text = "🟢 Online"
+    # elif st.session_state.get('model_cached', False):
+    #     api_status_color = "status-online"
+    #     api_status_text = "🟡 Cached"
+    # else:
+    #     api_status_color = "status-offline"
+    #     api_status_text = "🔴 Offline"
+    
+    # System Status (in sidebar)
+   # System Status
+    st.markdown("---")
+
+    # Test multiple connection methods
+    connection_status = "offline"
     if api_connected:
-        api_status_color = "status-online"
-        api_status_text = "🟢 Online"
+        connection_status = "online"
     elif st.session_state.get('model_cached', False):
-        api_status_color = "status-online"
-        api_status_text = "🟡 Cached"
-    else:
-        api_status_color = "status-offline"
-        api_status_text = "🔴 Offline"
+        connection_status = "cached"
+
+    status_colors = {
+        "online": ("🟢", "Online"),
+        "cached": ("🟡", "Cached"), 
+        "offline": ("🔴", "Offline")
+    }
+
+    color, status_text = status_colors[connection_status]
 
     st.markdown(f"""
     <div class="kenyan-card" style="padding: 1rem;">
         <h4 style="color: #FFD700; margin-bottom: 0.5rem;">📊 System Status</h4>
-        <p style="margin: 0.2rem 0;" class="{api_status_color}">
-            <strong>API:</strong> {api_status_text}
+        <p style="margin: 0.2rem 0;">
+            <strong>API:</strong> {color} {status_text}
         </p>
         <p style="margin: 0.2rem 0;">
             <strong>Language:</strong> {st.session_state.selected_language}
@@ -982,54 +1041,80 @@ elif selected_page == current_texts["plant_doctor"]:
                     #     st.session_state.analysis_result = result
 
                     # In the analyze button click handler, replace the prediction logic:
-                    if api_connected:
-                        success, result = predict_with_fastapi(uploaded_file)
-                        if success and result.get('success'):
-                            st.session_state.analysis_result = result
-                            st.success("✅ Analysis completed with FastAPI!")
-                        else:
-                            st.warning("⚠️ FastAPI error, using cached mode")
-                            result = get_cached_prediction()
-                            st.session_state.analysis_result = result
-                    elif st.session_state.get('model_cached', False):
+                    # if api_connected:
+                    #     success, result = predict_with_fastapi(uploaded_file)
+                    #     if success and result.get('success'):
+                    #         st.session_state.analysis_result = result
+                    #         st.success("✅ Analysis completed with FastAPI!")
+                    #     else:
+                    #         st.warning("⚠️ FastAPI error, using cached mode")
+                    #         result = get_cached_prediction()
+                    #         st.session_state.analysis_result = result
+                    
+                    # elif not api_connected and st.session_state.get('model_cached', False):
+                    #     st.info("📱 Using cached analysis mode")
+                    #     result = get_cached_prediction()
+
+                    #     st.session_state.analysis_result = result
+                    # else:
+                    #     st.info("📱 Using offline simulation mode")
+                    #     result = simulate_disease_prediction()
+                    #     st.session_state.analysis_result = result
+                                        
+                    # processing_time = time.time() - start_time
+                    
+                    success = False
+                    result = None
+
+                    # Try FastAPI with multiple URLs
+                    urls_to_try = [
+                        FASTAPI_BASE_URL,
+                        os.getenv("FASTAPI_PUBLIC_URL", ""),
+                        "http://127.0.0.1:8000",
+                        f"http://{get_local_ip()}:8000"
+                    ]
+
+                    for attempt_url in urls_to_try:
+                        if not attempt_url or success:
+                            continue
+                        try:
+                            files = {}
+                            if hasattr(uploaded_file, 'name') and hasattr(uploaded_file, 'type'):
+                                files["file"] = (uploaded_file.name, uploaded_file, uploaded_file.type)
+                            else:
+                                uploaded_file.seek(0)
+                                content = uploaded_file.read()
+                                uploaded_file.seek(0)
+                                files["file"] = ("image.jpg", BytesIO(content), "image/jpeg")
+                            
+                            resp = requests.post(f"{attempt_url}/predict", files=files, timeout=25)
+                            if resp.status_code == 200:
+                                result = safe_json(resp)
+                                if result.get('success'):
+                                    success = True
+                                    st.success("✅ Analysis completed with FastAPI!")
+                                    break
+                        except Exception:
+                            continue
+
+                    # Fallback to cached mode
+                    if not success and st.session_state.get('model_cached', False):
                         st.info("📱 Using cached analysis mode")
                         result = get_cached_prediction()
-                        st.session_state.analysis_result = result
-                    else:
+                        success = True
+
+                    # Final fallback to offline simulation
+                    if not success:
                         st.info("📱 Using offline simulation mode")
                         result = simulate_disease_prediction()
-                        st.session_state.analysis_result = result
-                                        
+                        success = True
+
                     processing_time = time.time() - start_time
-                    
-                    # Process results
-                    if st.session_state.analysis_result:
-                        result = st.session_state.analysis_result
-                        predicted_class = result.get("predicted_class", "unknown")
-                        confidence = result.get("confidence", 0)
-                        
-                        # Ensure confidence is percentage
-                        if confidence <= 1:
-                            confidence *= 100
-                        
-                        disease_info = PLANT_DISEASES.get(predicted_class, {})
-                        
-                        # Store in history
-                        analysis_data = {
-                            'analysis_id': analysis_id,
-                            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            'user_name': st.session_state.user_name or 'Anonymous',
-                            'weather': st.session_state.weather_condition,
-                            'soil': st.session_state.soil_type,
-                            'language': st.session_state.selected_language,
-                            'predicted_class': predicted_class,
-                            'confidence': confidence,
-                            'disease_info': disease_info,
-                            'processing_time': processing_time,
-                            'api_used': api_connected and result.get('success', False)
-                        }
-                        st.session_state.analysis_history.append(analysis_data)
-            
+
+                    if success and result:
+                        st.session_state.analysis_result = result
+
+
             # Display results if available
             if st.session_state.analysis_result:
                 result = st.session_state.analysis_result
@@ -1917,13 +2002,15 @@ elif selected_page == current_texts["settings"]:
                 help="Maximum time to wait for API response"
             )
             
-            # Auto-refresh dashboard
+            #Auto-refresh dashboard
             auto_refresh = st.checkbox(
                 "🔄 Auto-refresh Dashboard",
                 value=False,
                 help="Automatically refresh dashboard every 30 seconds"
             )
             
+            
+
             # Debug mode
             debug_mode = st.checkbox(
                 "🐛 Debug Mode",
@@ -1963,10 +2050,15 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+
 # Auto-refresh for dashboard (if enabled)
-if selected_page == current_texts["dashboard"] and 'auto_refresh' in locals() and auto_refresh:
-    time.sleep(30)
-    st.experimental_rerun()
+if (selected_page == current_texts["dashboard"] and 
+    st.session_state.get('auto_refresh', False) and 
+    st.session_state.analysis_history):
+    # Add refresh button instead of automatic refresh
+    if st.button("🔄 Refresh Dashboard"):
+        st.rerun()
+
 
 # Performance monitoring (if debug mode enabled)
 if 'debug_mode' in locals() and debug_mode:
