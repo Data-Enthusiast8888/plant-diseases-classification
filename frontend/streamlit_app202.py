@@ -39,31 +39,9 @@ st.set_page_config(
 
 
 # At the top of your script, add:
-
-#os.environ["FASTAPI_PUBLIC_URL"] = "https://your-ngrok-url.ngrok.io"  # or your public IP
 os.environ["FASTAPI_PUBLIC_URL"] = "http://203.0.113.1:8000"
-
-def get_api_url():
-    """Get FastAPI URL with fallback options"""
-    # Priority order: Environment variable, public IP, local IP, localhost
-    if os.getenv("FASTAPI_URL"):
-        return os.getenv("FASTAPI_URL")
-    
-    # For production/public deployment
-    if os.getenv("FASTAPI_PUBLIC_URL"):
-        return os.getenv("FASTAPI_PUBLIC_URL")
-    
-    # Try local network IP
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        return f"http://{local_ip}:8000"
-    except:
-        return "http://127.0.0.1:8000"
-
-FASTAPI_BASE_URL = get_api_url()
+os.environ.setdefault("FASTAPI_URL", "http://127.0.0.1:8000")
+os.environ.setdefault("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000")
 
 
 def get_local_ip():
@@ -76,6 +54,48 @@ def get_local_ip():
         return local_ip
     except:
         return "127.0.0.1"
+    
+
+def get_api_url():
+    """Get FastAPI URL with session state caching"""
+    # Use cached URL if available
+    if st.session_state.get('working_api_url'):
+        return st.session_state.working_api_url
+    
+    # Test URLs only once per session
+    urls_to_try = [
+        os.getenv("FASTAPI_URL"),
+        os.getenv("FASTAPI_PUBLIC_URL"),
+        f"http://{get_local_ip()}:8000",
+        "http://127.0.0.1:8000"
+    ]
+    
+    for url in urls_to_try:
+        if not url:
+            continue
+        try:
+            resp = requests.get(f"{url}/health", timeout=2)
+            if resp.status_code == 200:
+                st.session_state.working_api_url = url
+                return url
+        except:
+            continue
+    
+    return "http://127.0.0.1:8000"  # fallback
+
+FASTAPI_BASE_URL = get_api_url()
+
+
+# def get_local_ip():
+#     """Get local IP address"""
+#     try:
+#         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#         s.connect(("8.8.8.8", 80))
+#         local_ip = s.getsockname()[0]
+#         s.close()
+#         return local_ip
+#     except:
+#         return "127.0.0.1"
     
 
 FASTAPI_ENDPOINTS = {
@@ -107,7 +127,10 @@ def init_session_state():
         if key not in st.session_state:
             st.session_state[key] = value
 
-init_session_state()
+#init_session_state()
+if 'app_initialized' not in st.session_state:
+    init_session_state()
+    st.session_state.app_initialized = True
 
 # ===== UTILITY FUNCTIONS =====
 def safe_json(resp):
@@ -162,28 +185,15 @@ def translate_text_simple(text, target_lang):
         text = text.replace(eng, local)
     return text
 
-# ===== API FUNCTIONS =====
-# @st.cache_data(ttl=10)
-# def check_fastapi_connection(timeout=5):
-#     """Check FastAPI connection (online first, fallback only if offline)"""
-#     try:
-#         resp = requests.get(f"{FASTAPI_BASE_URL}/health", timeout=timeout)
-#         if resp.status_code == 200:
-#             # Cache model info once if available
-#             if 'model_cached' not in st.session_state:
-#                 cache_model_offline()
-#             return True, safe_json(resp)
-#         return False, safe_json(resp)
-#     except Exception as e:
-#         return False, {"error": str(e)}
-@st.cache_data(ttl=10)
-def check_fastapi_connection(timeout=5):
-    """Check FastAPI connection with multiple fallback URLs"""
+# Remove the @st.cache_data decorator from check_fastapi_connection
+def check_fastapi_connection(timeout=3):
+    """Check FastAPI connection with multiple fallback URLs - NO CACHING"""
     urls_to_try = [
-        FASTAPI_BASE_URL,
-        os.getenv("FASTAPI_PUBLIC_URL", ""),
+        os.getenv("FASTAPI_URL"),
+        os.getenv("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000"),
+        f"http://{get_local_ip()}:8000",
         "http://127.0.0.1:8000",
-        f"http://{get_local_ip()}:8000"
+        "http://localhost:8000"
     ]
     
     for url in urls_to_try:
@@ -192,14 +202,36 @@ def check_fastapi_connection(timeout=5):
         try:
             resp = requests.get(f"{url}/health", timeout=timeout)
             if resp.status_code == 200:
-                # Return the working URL along with success status
-                if 'model_cached' not in st.session_state:
-                    cache_model_offline()
+                print(f"✅ FastAPI connected at: {url}")
                 return True, safe_json(resp), url
-        except Exception:
+        except Exception as e:
+            print(f"❌ Failed to connect to {url}: {str(e)}")
             continue
     
+    print("❌ All FastAPI connection attempts failed")
     return False, {"error": "All connection attempts failed"}, None
+
+def get_api_url():
+    """Get working FastAPI URL - always test, don't cache failures"""
+    urls_to_try = [
+        os.getenv("FASTAPI_URL"),
+        os.getenv("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000"),
+        f"http://{get_local_ip()}:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000"
+    ]
+    
+    for url in urls_to_try:
+        if not url:
+            continue
+        try:
+            resp = requests.get(f"{url}/health", timeout=2)
+            if resp.status_code == 200:
+                return url
+        except:
+            continue
+    
+    return "http://127.0.0.1:8000"  # fallback
 
 def predict_with_fastapi(file_obj, timeout=25):
     """Send image to FastAPI for prediction"""
@@ -249,6 +281,49 @@ def batch_predict_with_fastapi(file_list, timeout=60):
             
     except Exception as e:
         return False, {"error": str(e)}
+
+def perform_batch_fastapi_analysis(uploaded_files, max_retries=2):
+    """Robust batch FastAPI analysis"""
+    
+    urls_to_try = [
+        os.getenv("FASTAPI_URL"),
+        os.getenv("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000"), 
+        f"http://{get_local_ip()}:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000"
+    ]
+    
+    for attempt_url in urls_to_try:
+        if not attempt_url:
+            continue
+            
+        for retry in range(max_retries):
+            try:
+                files = []
+                for i, file_obj in enumerate(uploaded_files):
+                    if hasattr(file_obj, 'seek'):
+                        file_obj.seek(0)
+                    
+                    if hasattr(file_obj, 'name') and hasattr(file_obj, 'type'):
+                        files.append(('files', (file_obj.name, file_obj, file_obj.type)))
+                    else:
+                        files.append(('files', (f"image_{i}.jpg", file_obj, "image/jpeg")))
+                
+                print(f"🔄 Attempting batch FastAPI at {attempt_url} (retry {retry + 1})")
+                resp = requests.post(f"{attempt_url}/batch_predict", files=files, timeout=60)
+                
+                if resp.status_code == 200:
+                    result = safe_json(resp)
+                    if result.get('success'):
+                        print(f"✅ Batch FastAPI successful at {attempt_url}")
+                        return True, result
+                        
+            except Exception as e:
+                print(f"❌ Batch FastAPI attempt failed: {str(e)}")
+                time.sleep(2)
+                continue
+    
+    return False, {"error": "All batch FastAPI attempts failed"}
 
 def get_model_info(timeout=10):
     """Get model information from FastAPI"""
@@ -545,6 +620,17 @@ UI_TEXTS = {
     }
 }
 
+def apply_enhanced_css():
+    if 'css_applied' not in st.session_state:
+        st.session_state.css_applied = True
+        st.markdown("""
+         ... existing CSS code ...
+        """, unsafe_allow_html=True)
+
+# Only call if not already applied
+if 'css_applied' not in st.session_state:
+    apply_enhanced_css()
+
 # ===== ENHANCED CSS STYLING =====
 def apply_enhanced_css():
     st.markdown("""
@@ -742,6 +828,7 @@ apply_enhanced_css()
 # Check API status
 api_connected, api_info, working_url = check_fastapi_connection()
 
+
 # Update the working URL if found
 if working_url:
     FASTAPI_BASE_URL = working_url
@@ -752,16 +839,15 @@ if working_url:
         "batch_predict": f"{FASTAPI_BASE_URL}/batch_predict",
         "model_info": f"{FASTAPI_BASE_URL}/model/info"
     }
+    print(f"✅ Using FastAPI at: {working_url}")
+
+# Store working URL in session state to avoid repeated testing
+if 'working_api_url' not in st.session_state:
+    st.session_state.working_api_url = None
 
 # ===== SIDEBAR =====
 with st.sidebar:
     
-#     st.session_state.selected_language = st.selectbox(
-#     "🌍 Language / Lugha / Dhok",
-#     options=list(LANGUAGES.keys()),
-#     index=list(LANGUAGES.keys()).index(st.session_state.selected_language),
-#     key="language_selector"  # ADD THIS
-# )
     st.session_state.selected_language = st.selectbox(
     "🌐 Language / Lugha / Dhok",
     options=list(LANGUAGES.keys()),
@@ -803,29 +889,19 @@ with st.sidebar:
         },
     )
     
-    # System Status
-    # st.markdown("---")
     
-    # if api_connected:
-    #     api_status_color = "status-online"
-    #     api_status_text = "🟢 Online"
-    # elif st.session_state.get('model_cached', False):
-    #     api_status_color = "status-online"
-    #     api_status_text = "🟡 Cached"
-    # else:
-    #     api_status_color = "status-offline"
-    #     api_status_text = "🔴 Offline"
-    
-    # System Status (in sidebar)
-   # System Status
-    st.markdown("---")
 
-    # Test multiple connection methods
-    connection_status = "offline"
-    if api_connected:
-        connection_status = "online"
-    elif st.session_state.get('model_cached', False):
-        connection_status = "cached"
+    st.markdown("---")
+    # Use cached status to avoid repeated API calls
+    if 'cached_api_status' not in st.session_state:
+        st.session_state.cached_api_status = "online" if api_connected else "offline"
+    if st.button("🔄 Refresh API Status", use_container_width=True):
+    # Clear any cached connection results
+        if 'cached_api_status' in st.session_state:
+            del st.session_state.cached_api_status
+        # Force recheck
+        st.rerun()    
+    connection_status = st.session_state.cached_api_status
 
     status_colors = {
         "online": ("🟢", "Online"),
@@ -834,6 +910,12 @@ with st.sidebar:
     }
 
     color, status_text = status_colors[connection_status]
+
+    # Cache the connection result to avoid repeated calls
+    if api_connected and 'cached_api_status' not in st.session_state:
+        st.session_state.cached_api_status = "online"
+    elif not api_connected and 'cached_api_status' not in st.session_state:
+        st.session_state.cached_api_status = "offline"
 
     st.markdown(f"""
     <div class="kenyan-card" style="padding: 1rem;">
@@ -1007,113 +1089,103 @@ elif selected_page == current_texts["plant_doctor"]:
             image = Image.open(uploaded_file)
             st.image(image, caption="📸 Plant Photo for Analysis", use_column_width=True)
             
-            # Analysis button
+            # Analysis button    
             if st.button(current_texts["analyze_plant"], type="primary", use_container_width=True):
-                try:
-                    img_array = np.array(image)
-                    if img_array.mean() < 10 or img_array.mean() > 245:  # Too dark/bright
-                        st.error("❌ Image quality too poor for analysis")
-                        st.stop()
-                except:
-                    st.error("❌ Invalid image format")
-                    st.stop()
-                # Generate analysis ID
-                analysis_id = str(uuid.uuid4())[:8]
-                st.session_state.current_analysis_id = analysis_id
-                
-                with st.spinner("🔬 Analyzing your plant... Please wait."):
-                    start_time = time.time()
-                    
-                    # Try FastAPI first, fallback to simulation
-                    # if api_connected:
-                    #     success, result = predict_with_fastapi(uploaded_file)
+                    try:
+                        img_array = np.array(image)
+                        if image.size[0] > 1024 or image.size[1] > 1024:
+                            image = image.resize((min(1024, image.size[0]), min(1024, image.size[1])))
                         
-                    #     if success and result.get('success'):
-                    #         st.session_state.analysis_result = result
-                    #         st.success("✅ Analysis completed with FastAPI!")
-                    #     else:
-                    #         st.warning("⚠️ FastAPI error, using offline mode")
-                    #         result = simulate_disease_prediction()
-                    #         st.session_state.analysis_result = result
-                    # else:
-                    #     st.info("📱 Using offline analysis mode")
-                    #     result = simulate_disease_prediction()
-                    #     st.session_state.analysis_result = result
+                        if img_array.mean() < 10 or img_array.mean() > 245:
+                            st.error("⚠ Image quality too poor for analysis")
+                            st.stop()
+                    except:
+                        st.error("⚠ Invalid image format")
+                        st.stop()
 
-                    # In the analyze button click handler, replace the prediction logic:
-                    # if api_connected:
-                    #     success, result = predict_with_fastapi(uploaded_file)
-                    #     if success and result.get('success'):
-                    #         st.session_state.analysis_result = result
-                    #         st.success("✅ Analysis completed with FastAPI!")
-                    #     else:
-                    #         st.warning("⚠️ FastAPI error, using cached mode")
-                    #         result = get_cached_prediction()
-                    #         st.session_state.analysis_result = result
-                    
-                    # elif not api_connected and st.session_state.get('model_cached', False):
-                    #     st.info("📱 Using cached analysis mode")
-                    #     result = get_cached_prediction()
+                    # Generate analysis ID
+                    analysis_id = str(uuid.uuid4())[:8]
+                    st.session_state.current_analysis_id = analysis_id
 
-                    #     st.session_state.analysis_result = result
-                    # else:
-                    #     st.info("📱 Using offline simulation mode")
-                    #     result = simulate_disease_prediction()
-                    #     st.session_state.analysis_result = result
-                                        
-                    # processing_time = time.time() - start_time
-                    
-                    success = False
-                    result = None
-
-                    # Try FastAPI with multiple URLs
-                    urls_to_try = [
-                        FASTAPI_BASE_URL,
-                        os.getenv("FASTAPI_PUBLIC_URL", ""),
-                        "http://127.0.0.1:8000",
-                        f"http://{get_local_ip()}:8000"
-                    ]
-
-                    for attempt_url in urls_to_try:
-                        if not attempt_url or success:
-                            continue
-                        try:
-                            files = {}
-                            if hasattr(uploaded_file, 'name') and hasattr(uploaded_file, 'type'):
-                                files["file"] = (uploaded_file.name, uploaded_file, uploaded_file.type)
+                    with st.spinner("🔬 Analyzing your plant... Please wait."):
+                        start_time = time.time()
+                        
+                        # PRIORITY 1: Try FastAPI extensively
+                        st.info("🚀 Attempting FastAPI analysis...")
+                        success, result = predict_with_fastapi(uploaded_file)
+                        
+                        if success and result.get('success'):
+                            st.success("✅ Analysis completed with FastAPI!")
+                            st.session_state.analysis_result = result
+                        else:
+                            # PRIORITY 2: Only after exhaustive FastAPI attempts
+                            st.warning("⚠️ FastAPI unavailable, using cached mode")
+                            if st.session_state.get('model_cached', False):
+                                st.info("📱 Using cached analysis mode")
+                                result = get_cached_prediction()
+                                st.session_state.analysis_result = result
                             else:
-                                uploaded_file.seek(0)
-                                content = uploaded_file.read()
-                                uploaded_file.seek(0)
-                                files["file"] = ("image.jpg", BytesIO(content), "image/jpeg")
-                            
-                            resp = requests.post(f"{attempt_url}/predict", files=files, timeout=25)
-                            if resp.status_code == 200:
-                                result = safe_json(resp)
-                                if result.get('success'):
-                                    success = True
-                                    st.success("✅ Analysis completed with FastAPI!")
-                                    break
-                        except Exception:
-                            continue
+                                # PRIORITY 3: Final fallback
+                                st.info("📱 Using offline simulation mode")
+                                result = simulate_disease_prediction()
+                                st.session_state.analysis_result = result
+                        
+                        processing_time = time.time() - start_time
+                        print(f"⏱️ Total processing time: {processing_time:.2f}s")        
+                                    
+                    def perform_fastapi_analysis(uploaded_file, max_retries=3):
+                        """Robust FastAPI analysis with multiple URL attempts"""
+                        
+                        urls_to_try = [
+                            os.getenv("FASTAPI_URL"),
+                            os.getenv("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000"),
+                            f"http://{get_local_ip()}:8000",
+                            "http://127.0.0.1:8000",
+                            "http://localhost:8000"
+                        ]
+                        
+                        for attempt_url in urls_to_try:
+                            if not attempt_url:
+                                continue
+                                
+                            for retry in range(max_retries):
+                                try:
+                                    # Prepare file data
+                                    uploaded_file.seek(0)
+                                    files = {}
+                                    if hasattr(uploaded_file, 'name') and hasattr(uploaded_file, 'type'):
+                                        files["file"] = (uploaded_file.name, uploaded_file, uploaded_file.type)
+                                    else:
+                                        content = uploaded_file.read()
+                                        uploaded_file.seek(0)
+                                        files["file"] = ("image.jpg", BytesIO(content), "image/jpeg")
+                                    
+                                    print(f"🔄 Attempting FastAPI prediction at {attempt_url} (retry {retry + 1})")
+                                    resp = requests.post(f"{attempt_url}/predict", files=files, timeout=30)
+                                    
+                                    if resp.status_code == 200:
+                                        result = safe_json(resp)
+                                        if result.get('success'):
+                                            print(f"✅ FastAPI prediction successful at {attempt_url}")
+                                            return True, result
+                                        
+                                except Exception as e:
+                                    print(f"❌ FastAPI attempt failed: {str(e)}")
+                                    time.sleep(1)  # Brief delay between retries
+                                    continue
+                        
+                        print("❌ All FastAPI prediction attempts exhausted")
+                        return False, {"error": "All FastAPI attempts failed"}
 
-                    # Fallback to cached mode
-                    if not success and st.session_state.get('model_cached', False):
-                        st.info("📱 Using cached analysis mode")
-                        result = get_cached_prediction()
-                        success = True
 
-                    # Final fallback to offline simulation
-                    if not success:
-                        st.info("📱 Using offline simulation mode")
-                        result = simulate_disease_prediction()
-                        success = True
 
                     processing_time = time.time() - start_time
 
-                    if success and result:
-                        st.session_state.analysis_result = result
-
+                    # if success and result:
+                    #     st.session_state.analysis_result = result
+                    # # Add after line 900 (before analysis starts)
+                
+                
 
             # Display results if available
             if st.session_state.analysis_result:
@@ -1340,7 +1412,8 @@ elif selected_page == current_texts["batch_analysis"]:
                         # Offline batch processing
                         st.info("📱 Using offline batch processing")
                         results = [simulate_disease_prediction() for _ in uploaded_files]
-                    
+
+                
                     # Store batch results
                     batch_analysis = {
                         'batch_id': str(uuid.uuid4())[:8],
@@ -1882,7 +1955,7 @@ elif selected_page == current_texts["settings"]:
             
             if st.button("🔄 Test API Connection", use_container_width=True):
                 with st.spinner("Testing connection..."):
-                    test_success, test_info = check_fastapi_connection()
+                    test_success, test_info, working_api_url = check_fastapi_connection()
                     if test_success:
                         st.success("✅ API connection successful!")
                         st.json(test_info)
