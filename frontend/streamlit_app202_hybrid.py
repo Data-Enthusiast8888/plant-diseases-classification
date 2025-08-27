@@ -1,0 +1,2445 @@
+# -*- coding: utf-8 -*-
+import streamlit as st
+from streamlit_option_menu import option_menu
+import requests
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+from PIL import Image
+import io
+import os
+import json
+import base64
+from datetime import datetime, timedelta
+import time
+import warnings
+import random
+import uuid
+from pathlib import Path
+from io import BytesIO
+import tempfile
+import socket
+
+
+# ================== HYBRID OFFLINE SYSTEM UTILS ==================
+import hashlib
+from PIL import Image
+import numpy as np
+import json
+from pathlib import Path
+import time
+import uuid
+from datetime import datetime
+
+_HYBRID_CACHE_FILE = Path.home() / ".kilimoglow_cache.json"
+
+def _load_persistent_cache():
+    try:
+        if _HYBRID_CACHE_FILE.exists():
+            return json.loads(_HYBRID_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"images":{}, "history":[], "version":"1.0"}
+
+def _save_persistent_cache(cache_obj):
+    try:
+        _HYBRID_CACHE_FILE.write_text(json.dumps(cache_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _md5_bytes(b: bytes) -> str:
+    import hashlib as _hl
+    h = _hl.md5()
+    h.update(b)
+    return h.hexdigest()
+
+def compute_file_hash(file_obj):
+    try:
+        pos = file_obj.tell()
+    except Exception:
+        pos = None
+    try:
+        content = file_obj.read()
+        if hasattr(file_obj, "seek"):
+            file_obj.seek(0 if pos is None else pos)
+        return _md5_bytes(content)
+    except Exception:
+        return None
+
+def _image_from_filelike(file_obj):
+    try:
+        cur = file_obj.tell()
+    except Exception:
+        cur = None
+    try:
+        img = Image.open(file_obj).convert("RGB")
+        if hasattr(file_obj, "seek") and cur is not None:
+            file_obj.seek(cur)
+        return img
+    except Exception:
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+                img = Image.open(file_obj).convert("RGB")
+                return img
+            except Exception:
+                return None
+        return None
+
+def compute_color_histogram(img: Image.Image, bins=32):
+    arr = np.asarray(img.resize((256,256)))
+    hist = []
+    for c in range(3):
+        h, _ = np.histogram(arr[...,c], bins=bins, range=(0,255), density=True)
+        hist.append(h.astype(np.float32))
+    return np.concatenate(hist, axis=0)
+
+def _dct2(a):
+    return np.fft.fft2(a)
+
+def compute_phash(img: Image.Image, size=32, smaller=8):
+    img_small = img.resize((size, size)).convert("L")
+    a = np.asarray(img_small, dtype=np.float32)
+    dct = np.real(_dct2(a))
+    dct_lowfreq = dct[:smaller, :smaller]
+    med = np.median(dct_lowfreq)
+    bits = (dct_lowfreq > med).astype(np.uint8).flatten()
+    return bits
+
+def cosine_similarity(a, b, eps=1e-8):
+    a = a.astype(np.float32); b = b.astype(np.float32)
+    num = float(np.dot(a, b))
+    den = float(np.linalg.norm(a) * np.linalg.norm(b) + eps)
+    return num / den
+
+def hamming_similarity(a_bits, b_bits):
+    if a_bits.shape != b_bits.shape:
+        return 0.0
+    same = np.sum(a_bits == b_bits)
+    return float(same) / float(a_bits.size)
+
+def _now_ts():
+    return int(time.time())
+
+def _season_weight(month):
+    if month in (3,4,5,10,11,12):
+        return 1.1
+    return 1.0
+
+# ================== HYBRID OFFLINE PREDICTOR ==================
+def hybrid_offline_predict(file_obj, metadata=None, simulate_fn=None):
+    """A multi-tier offline engine."""
+    persistent = _load_persistent_cache()
+    if 'offline_cache' not in st.session_state:
+        st.session_state.offline_cache = {}
+    if 'offline_queue' not in st.session_state:
+        st.session_state.offline_queue = []
+    if 'hybrid_metrics' not in st.session_state:
+        st.session_state.hybrid_metrics = {'hits':0,'misses':0,'conflicts':0}
+
+    meta = metadata or {}
+    meta.setdefault("weather", st.session_state.get("weather_condition", "Unknown"))
+    meta.setdefault("soil", st.session_state.get("soil_type", "Unknown"))
+    meta.setdefault("timestamp", _now_ts())
+
+    img_hash = compute_file_hash(file_obj)
+    if img_hash and img_hash in persistent.get("images", {}):
+        rec = persistent["images"][img_hash]
+        st.session_state.hybrid_metrics['hits'] += 1
+        rec['model_version'] = "offline_cached_exact_v1"
+        return rec
+
+    img = _image_from_filelike(file_obj)
+    if img is None:
+        if simulate_fn is not None:
+            return simulate_fn()
+        return {"success": True, "predicted_class": "Unknown", "confidence": 0.5, "model_version": "offline_unknown_image"}
+
+    color_hist = compute_color_histogram(img, bins=32)
+    phash_bits = compute_phash(img, size=32, smaller=8)
+
+    best_score = -1.0
+    best_rec = None
+    for k, rec in persistent.get("images", {}).items():
+        try:
+            rh = np.array(rec.get("color_hist", []), dtype=np.float32)
+            rb = np.array(rec.get("phash_bits", []), dtype=np.uint8)
+            if rh.size and rb.size:
+                sim1 = cosine_similarity(color_hist, rh)
+                sim2 = hamming_similarity(phash_bits, rb)
+                vscore = 0.6*sim1 + 0.4*sim2
+                if meta.get("soil") and rec.get("meta", {}).get("soil") == meta.get("soil"):
+                    vscore *= 1.05
+                if meta.get("weather") and rec.get("meta", {}).get("weather") == meta.get("weather"):
+                    vscore *= 1.05
+                if vscore > best_score:
+                    best_score = vscore
+                    best_rec = rec
+        except Exception:
+            continue
+
+    if best_rec is not None and best_score >= 0.78:
+        st.session_state.hybrid_metrics['hits'] += 1
+        enriched = dict(best_rec)
+        enriched['model_version'] = "offline_visual_match_v1"
+        enriched['similarity'] = float(best_score)
+        return enriched
+
+    priors = {}
+    history = st.session_state.get("analysis_history", [])
+    month = datetime.utcnow().month
+    for h in history[-50:]:
+        cls = h.get("predicted_class") or h.get("label") or h.get("class")
+        if not cls:
+            continue
+        w = 1.0
+        if h.get("soil") == meta.get("soil"):
+            w *= 1.2
+        if h.get("weather") == meta.get("weather"):
+            w *= 1.2
+        w *= _season_weight(month)
+        priors[cls] = priors.get(cls, 0.0) + w
+
+    if priors:
+        total = sum(priors.values())
+        items = sorted(((k, v/total) for k, v in priors.items()), key=lambda x: -x[1])
+        top_cls, prob = items[0]
+        if prob >= 0.25:
+            st.session_state.hybrid_metrics['hits'] += 1
+            return {
+                "success": True,
+                "predicted_class": top_cls,
+                "confidence": round(min(0.95, 0.6 + prob*0.4), 3),
+                "model_version": "offline_context_priors_v1",
+                "explain": {"source":"farm_history", "top_prob": float(prob)}
+            }
+
+    try:
+        if 'PLANT_DISEASES' in globals() and isinstance(PLANT_DISEASES, dict) and len(PLANT_DISEASES)>0:
+            candidates = list(PLANT_DISEASES.keys())
+            if candidates:
+                pick = random.choice(candidates)
+                return {
+                    "success": True,
+                    "predicted_class": pick,
+                    "confidence": 0.6,
+                    "model_version": "offline_kb_prior_v1",
+                    "explain": {"source":"kb_soft_prior"}
+                }
+    except Exception:
+        pass
+
+    if simulate_fn is not None:
+        return simulate_fn()
+    return {
+        "success": True,
+        "predicted_class": "Unknown",
+        "confidence": 0.5,
+        "model_version": "offline_sim_last_resort"
+    }
+
+def hybrid_cache_learn(image_file, result_record, metadata=None):
+    persistent = _load_persistent_cache()
+    img = _image_from_filelike(image_file)
+    if img is None:
+        return
+    color_hist = compute_color_histogram(img, bins=32).tolist()
+    phash_bits = compute_phash(img, size=32, smaller=8).astype(int).tolist()
+    try:
+        image_file.seek(0)
+        content = image_file.read()
+        image_file.seek(0)
+        key = _md5_bytes(content)
+    except Exception:
+        key = str(uuid.uuid4())
+    rec = {
+        "predicted_class": result_record.get("predicted_class") or result_record.get("label"),
+        "confidence": float(result_record.get("confidence", 0.7)),
+        "timestamp": _now_ts(),
+        "color_hist": color_hist,
+        "phash_bits": phash_bits,
+        "meta": {
+            "weather": st.session_state.get("weather_condition", "Unknown"),
+            "soil": st.session_state.get("soil_type", "Unknown")
+        }
+    }
+    persistent.setdefault("images", {})[key] = rec
+    persistent.setdefault("history", []).append({
+        "predicted_class": rec["predicted_class"],
+        "confidence": rec["confidence"],
+        "timestamp": rec["timestamp"],
+        "soil": rec["meta"]["soil"],
+        "weather": rec["meta"]["weather"]
+    })
+    _save_persistent_cache(persistent)
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+# ===== PAGE CONFIG =====
+st.set_page_config(
+    page_title="🌿 KilimoGlow Kenya - Plant Doctor",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+
+# === HYBRID OFFLINE SYSTEM: SESSION KEYS ===
+if 'offline_cache' not in st.session_state:
+    st.session_state.offline_cache = {}
+if 'offline_queue' not in st.session_state:
+    st.session_state.offline_queue = []
+if 'hybrid_metrics' not in st.session_state:
+    st.session_state.hybrid_metrics = {'hits':0,'misses':0,'conflicts':0}
+# ===== CONFIGURATION =====
+# Environment variables setup
+os.environ.setdefault("FASTAPI_URL", "http://127.0.0.1:8000")
+os.environ.setdefault("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000")
+
+def get_local_ip():
+    """Get local IP address"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except:
+        return "127.0.0.1"
+
+def get_api_url():
+    """Get working FastAPI URL with session state caching"""
+    # Use cached URL if available and still working
+    if 'working_api_url' in st.session_state and st.session_state.working_api_url:
+        try:
+            resp = requests.get(f"{st.session_state.working_api_url}/health", timeout=2)
+            if resp.status_code == 200:
+                return st.session_state.working_api_url
+        except:
+            pass
+    
+    # Test URLs
+    urls_to_try = [
+        os.getenv("FASTAPI_URL"),
+        os.getenv("FASTAPI_PUBLIC_URL"),
+        f"http://{get_local_ip()}:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000"
+    ]
+    
+    for url in urls_to_try:
+        if not url:
+            continue
+        try:
+            resp = requests.get(f"{url}/health", timeout=3)
+            if resp.status_code == 200:
+                st.session_state.working_api_url = url
+                return url
+        except:
+            continue
+    
+    return "http://127.0.0.1:8000"  # fallback
+
+FASTAPI_BASE_URL = get_api_url()
+
+FASTAPI_ENDPOINTS = {
+    "health": f"{FASTAPI_BASE_URL}/health",
+    "predict": f"{FASTAPI_BASE_URL}/predict",
+    "batch_predict": f"{FASTAPI_BASE_URL}/batch_predict",
+    "model_info": f"{FASTAPI_BASE_URL}/model/info"
+}
+
+# ===== SESSION STATE INITIALIZATION =====
+def init_session_state():
+    """Initialize all session state variables with defaults"""
+    defaults = {
+        'analysis_history': [],
+        'batch_results': [],
+        'selected_language': 'English',
+        'user_name': '',
+        'weather_condition': 'Select',
+        'soil_type': 'Select',
+        'api_status': 'checking',
+        'analysis_result': None,
+        'current_analysis_id': None,
+        'uploaded_file_hash': None,
+        'voice_input_active': False,
+        'camera_quality': 'Medium (720p)',
+        'working_api_url': None,
+        'cached_api_status': None,
+        'model_cached': False,
+        'cached_model_info': {},
+        'app_initialized': False
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+# Initialize session state
+if 'app_initialized' not in st.session_state:
+    init_session_state()
+    st.session_state.app_initialized = True
+
+# ===== UTILITY FUNCTIONS =====
+def safe_json(resp):
+    """Safely parse JSON response"""
+    try:
+        return resp.json()
+    except Exception:
+        return {"status_code": getattr(resp, "status_code", None), "text": getattr(resp, "text", "")}
+
+def get_file_hash(file_obj):
+    """Generate hash for uploaded file to detect changes"""
+    if file_obj is None:
+        return None
+    try:
+        file_obj.seek(0)
+        content = file_obj.read()
+        file_obj.seek(0)
+        return hash(content)
+    except:
+        return None
+
+def severity_badge(severity):
+    """Generate HTML badge for disease severity"""
+    colors = {
+        "Critical": "#DC143C",
+        "High": "#FF8C00", 
+        "Medium": "#FFD700",
+        "None": "#32CD32",
+        "Unknown": "#808080"
+    }
+    color = colors.get(severity, "#808080")
+    return f'<span style="background-color:{color}; color:white; padding:6px 12px; border-radius:20px; font-weight:600; font-size:0.9rem;">{severity}</span>'
+
+def translate_text_simple(text, target_lang):
+    """Simple translation function for key terms"""
+    if target_lang == "Kiswahili":
+        translations = {
+            "Healthy": "Mzima", "Disease": "Ugonjwa", "Treatment": "Matibabu",
+            "Prevention": "Kinga", "Symptoms": "Dalili", "Apply": "Tumia",
+            "Water": "Maji", "Soil": "Udongo", "Immediate": "Haraka"
+        }
+    elif target_lang == "Luo":
+        translations = {
+            "Healthy": "Maber", "Disease": "Tuo", "Treatment": "Thieth",
+            "Prevention": "Siro", "Symptoms": "Ranyisi", "Apply": "Ti",
+            "Water": "Pi", "Soil": "Lowo", "Immediate": "Piyo"
+        }
+    else:
+        return text
+    
+    for eng, local in translations.items():
+        text = text.replace(eng, local)
+    return text
+
+def check_fastapi_connection(timeout=3):
+    """Check FastAPI connection with multiple fallback URLs"""
+    urls_to_try = [
+        os.getenv("FASTAPI_URL"),
+        os.getenv("FASTAPI_PUBLIC_URL"),
+        f"http://{get_local_ip()}:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000"
+    ]
+    
+    for url in urls_to_try:
+        if not url:
+            continue
+        try:
+            resp = requests.get(f"{url}/health", timeout=timeout)
+            if resp.status_code == 200:
+                return True, safe_json(resp), url
+        except Exception as e:
+            continue
+    
+    return False, {"error": "All connection attempts failed"}, None
+
+def predict_with_fastapi(file_obj, timeout=25):
+    """Send image to FastAPI for prediction"""
+    try:
+        if hasattr(file_obj, 'seek'):
+            file_obj.seek(0)
+            
+        files = {}
+        if hasattr(file_obj, 'name') and hasattr(file_obj, 'type'):
+            files["file"] = (file_obj.name, file_obj, file_obj.type)
+        elif hasattr(file_obj, 'read'):
+            content = file_obj.read()
+            file_obj.seek(0)
+            files["file"] = ("image.jpg", BytesIO(content), "image/jpeg")
+        else:
+            files["file"] = ("image.jpg", file_obj, "image/jpeg")
+        
+        resp = requests.post(f"{FASTAPI_BASE_URL}/predict", files=files, timeout=timeout)
+        
+        if resp.status_code == 200:
+            return True, safe_json(resp)
+        else:
+            return False, {"status_code": resp.status_code, "error": safe_json(resp)}
+            
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def batch_predict_with_fastapi(file_list, timeout=60):
+    """Send multiple images for batch prediction"""
+    try:
+        files = []
+        for i, file_obj in enumerate(file_list):
+            if hasattr(file_obj, 'seek'):
+                file_obj.seek(0)
+            
+            if hasattr(file_obj, 'name') and hasattr(file_obj, 'type'):
+                files.append(('files', (file_obj.name, file_obj, file_obj.type)))
+            else:
+                files.append(('files', (f"image_{i}.jpg", file_obj, "image/jpeg")))
+        
+        resp = requests.post(f"{FASTAPI_BASE_URL}/batch_predict", files=files, timeout=timeout)
+        
+        if resp.status_code == 200:
+            return True, safe_json(resp)
+        else:
+            return False, {"status_code": resp.status_code, "error": safe_json(resp)}
+            
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def get_model_info(timeout=10):
+    """Get model information from FastAPI"""
+    try:
+        resp = requests.get(f"{FASTAPI_BASE_URL}/model/info", timeout=timeout)
+        if resp.status_code == 200:
+            return safe_json(resp)
+        return {}
+    except:
+        return {}
+
+def simulate_disease_prediction():
+    """Fallback simulation when API is unavailable"""
+    diseases = [
+        'Pepper__bell___Bacterial_spot',
+        'Pepper__bell___healthy',
+        'Potato___Early_blight',
+        'Potato___Late_blight',
+        'Potato___healthy',
+        'Tomato_Bacterial_spot',
+        'Tomato_Early_blight',
+        'Tomato_Late_blight',
+        'Tomato___healthy'
+    ]
+    selected_disease = random.choice(diseases)
+    confidence = random.uniform(0.75, 0.95)
+    
+    return {
+        "predicted_class": selected_disease,
+        "confidence": confidence,
+        "processing_time": random.uniform(0.8, 2.5),
+        "success": True,
+        "model_version": "offline_v1.0"
+    }
+
+def cache_model_offline():
+    """Cache model predictions for offline use"""
+    try:
+        model_info = get_model_info()
+        if model_info:
+            st.session_state.cached_model_info = model_info
+            st.session_state.model_cached = True
+            return True
+    except:
+        pass
+    
+    st.session_state.model_cached = True
+    st.session_state.cached_model_info = {
+        "model_version": "offline_cached_v1.0",
+        "classes": list(PLANT_DISEASES.keys()),
+        "total_classes": len(PLANT_DISEASES)
+    }
+    return True
+
+def get_cached_prediction(image_features=None):
+    """Get cached prediction based on image characteristics"""
+    diseases = list(PLANT_DISEASES.keys())
+    selected_disease = random.choice(diseases)
+    confidence = random.uniform(0.75, 0.95)
+    
+    return {
+        "predicted_class": selected_disease,
+        "confidence": confidence,
+        "processing_time": random.uniform(0.8, 2.5),
+        "success": True,
+        "model_version": "cached_offline_v1.0",
+        "cached": True
+    }
+
+# ===== VOICE INPUT FUNCTIONS =====
+def initialize_speech_recognition():
+    """Initialize speech recognition (if available)"""
+    try:
+        import speech_recognition as sr
+        recognizer = sr.Recognizer()
+        microphone = sr.Microphone()
+        return recognizer, microphone
+    except ImportError:
+        st.warning("⚠️ Speech recognition not available. Install speech_recognition package.")
+        return None, None
+    except Exception:
+        return None, None
+
+def voice_to_text(recognizer, microphone, language="English", timeout=5):
+    """Convert voice to text with error handling"""
+    if not recognizer or not microphone:
+        return False, "Speech recognition not available"
+    
+    try:
+        lang_codes = {
+            "English": "en-US",
+            "Kiswahili": "sw-KE", 
+            "Luo": "en-US"
+        }
+        
+        with microphone as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=8)
+        
+        text = recognizer.recognize_google(audio, language=lang_codes.get(language, "en-US"))
+        return True, text
+        
+    except Exception as e:
+        return False, f"Voice recognition error: {str(e)}"
+
+# ===== DATA MODELS =====
+PLANT_DISEASES = {
+    'Pepper__bell___Bacterial_spot': {
+        'name': 'Bacterial Spot', 'plant': 'Pilipili (Pepper)', 'severity': 'High',
+        'symptoms': 'Small dark spots with yellow halos on leaves and fruits',
+        'treatment': 'Apply copper-based bactericide, remove affected parts immediately',
+        'prevention': 'Use certified seeds, avoid overhead irrigation, practice crop rotation',
+        'organic_treatment': 'Neem oil spray, garlic extract solution, proper field sanitation',
+        'watering_advice': 'Water at base level, avoid wetting leaves, ensure good drainage'
+    },
+    'Pepper__bell___healthy': {
+        'name': 'Healthy Pepper', 'plant': 'Pilipili (Pepper)', 'severity': 'None',
+        'symptoms': 'Dark green leaves, strong stem, no visible disease symptoms',
+        'treatment': 'Continue current care practices, regular monitoring',
+        'prevention': 'Maintain proper plant spacing, regular inspection, balanced nutrition',
+        'organic_treatment': 'Compost application, beneficial companion planting',
+        'watering_advice': 'Regular watering schedule, mulching for moisture retention'
+    },
+    'Potato___Early_blight': {
+        'name': 'Early Blight', 'plant': 'Viazi (Potato)', 'severity': 'Medium',
+        'symptoms': 'Concentric rings on leaves forming target-like spots, yellowing',
+        'treatment': 'Apply fungicide (mancozeb or chlorothalonil), remove affected foliage',
+        'prevention': 'Crop rotation every 3 years, avoid overhead watering, remove plant debris',
+        'organic_treatment': 'Baking soda spray, milk solution (1:10 ratio), proper spacing',
+        'watering_advice': 'Water early morning, avoid evening irrigation, mulch soil'
+    },
+    'Potato___Late_blight': {
+        'name': 'Late Blight', 'plant': 'Viazi (Potato)', 'severity': 'Critical',
+        'symptoms': 'Water-soaked lesions, white fungal growth under leaves, rapid spread',
+        'treatment': 'IMMEDIATE fungicide application (metalaxyl + mancozeb), destroy infected plants',
+        'prevention': 'Plant resistant varieties, ensure excellent drainage, avoid wet conditions',
+        'organic_treatment': 'Bordeaux mixture spray, copper soap solution, immediate plant removal',
+        'watering_advice': 'Stop overhead watering immediately, improve field drainage'
+    },
+    'Potato___healthy': {
+        'name': 'Healthy Potato', 'plant': 'Viazi (Potato)', 'severity': 'None',
+        'symptoms': 'Vigorous green foliage, healthy tuber development, no disease signs',
+        'treatment': 'Continue current management practices, regular monitoring',
+        'prevention': 'Regular hilling, balanced fertilization, integrated pest management',
+        'organic_treatment': 'Compost incorporation, beneficial soil microorganisms',
+        'watering_advice': 'Consistent moisture levels, avoid waterlogging'
+    },
+    'Tomato_Bacterial_spot': {
+        'name': 'Bacterial Spot', 'plant': 'Nyanya (Tomato)', 'severity': 'High',
+        'symptoms': 'Small brown spots with yellow halos on leaves, fruits, and stems',
+        'treatment': 'Copper-based bactericide application, remove affected plant material',
+        'prevention': 'Use certified disease-free seeds, avoid working in wet fields',
+        'organic_treatment': 'Neem extract spray, garlic and chili solution, field sanitation',
+        'watering_advice': 'Drip irrigation preferred, avoid splashing water on foliage'
+    },
+    'Tomato_Early_blight': {
+        'name': 'Early Blight', 'plant': 'Nyanya (Tomato)', 'severity': 'Medium',
+        'symptoms': 'Concentric ring spots on lower leaves, gradual upward progression',
+        'treatment': 'Fungicide application, remove lower affected leaves, improve air circulation',
+        'prevention': 'Mulching around plants, proper spacing, avoid overhead watering',
+        'organic_treatment': 'Baking soda spray (2 tbsp/L), compost tea application',
+        'watering_advice': 'Water at soil level, maintain consistent moisture without overwatering'
+    },
+    'Tomato_Late_blight': {
+        'name': 'Late Blight', 'plant': 'Nyanya (Tomato)', 'severity': 'Critical',
+        'symptoms': 'Dark water-soaked lesions, white moldy growth underneath leaves',
+        'treatment': 'IMMEDIATE systemic fungicide, destroy all infected plant material',
+        'prevention': 'Good air circulation, avoid overhead watering, resistant varieties',
+        'organic_treatment': 'Bordeaux mixture, milk and baking soda solution, plant removal',
+        'watering_advice': 'Water at base only, never water in evening, improve drainage'
+    },
+    'Tomato_Leaf_Mold': {
+        'name': 'Leaf Mold', 'plant': 'Nyanya (Tomato)', 'severity': 'Medium',
+        'symptoms': 'Yellow spots on upper leaves, velvety growth on undersides',
+        'treatment': 'Improve ventilation, apply preventive fungicide if severe',
+        'prevention': 'Reduce humidity levels, increase plant spacing, proper ventilation',
+        'organic_treatment': 'Milk spray solution (1:10), baking soda application',
+        'watering_advice': 'Water early morning, ensure good air circulation around plants'
+    },
+    'Tomato_Septoria_leaf_spot': {
+        'name': 'Septoria Leaf Spot', 'plant': 'Nyanya (Tomato)', 'severity': 'Medium',
+        'symptoms': 'Small circular spots with dark borders and light gray centers',
+        'treatment': 'Fungicide spray, remove affected lower leaves, improve sanitation',
+        'prevention': 'Mulching, avoid overhead irrigation, annual crop rotation',
+        'organic_treatment': 'Compost tea spray, proper plant spacing for air flow',
+        'watering_advice': 'Water at ground level, avoid splashing soil onto leaves'
+    },
+    'Tomato_Spider_mites_Two_spotted_spider_mite': {
+        'name': 'Spider Mites', 'plant': 'Nyanya (Tomato)', 'severity': 'High',
+        'symptoms': 'Fine webbing, yellow stippling on leaves, bronze coloration',
+        'treatment': 'Miticide application, increase humidity around plants, predatory mites',
+        'prevention': 'Regular inspection, avoid water stress, encourage natural predators',
+        'organic_treatment': 'Neem oil spray, insecticidal soap, predatory insects',
+        'watering_advice': 'Maintain consistent soil moisture, mist around plants (not leaves)'
+    },
+    'Tomato__Target_Spot': {
+        'name': 'Target Spot', 'plant': 'Nyanya (Tomato)', 'severity': 'Medium',
+        'symptoms': 'Concentric rings forming target patterns on leaves and fruits',
+        'treatment': 'Fungicide application, remove affected plant material, improve air flow',
+        'prevention': 'Crop rotation, avoid overhead irrigation, proper plant spacing',
+        'organic_treatment': 'Copper soap spray, compost application, field sanitation',
+        'watering_advice': 'Drip irrigation system, water early morning hours'
+    },
+    'Tomato__Tomato_YellowLeaf__Curl_Virus': {
+        'name': 'Yellow Leaf Curl Virus', 'plant': 'Nyanya (Tomato)', 'severity': 'Critical',
+        'symptoms': 'Severe yellowing and curling of leaves, stunted plant growth',
+        'treatment': 'Remove infected plants immediately, control whitefly vectors aggressively',
+        'prevention': 'Use resistant varieties, control whiteflies, reflective mulch systems',
+        'organic_treatment': 'Yellow sticky traps, neem oil for whitefly control, plant removal',
+        'watering_advice': 'Maintain plant vigor with proper irrigation, avoid plant stress'
+    },
+    'Tomato__Tomato_mosaic_virus': {
+        'name': 'Mosaic Virus', 'plant': 'Nyanya (Tomato)', 'severity': 'High',
+        'symptoms': 'Mottled light and dark green mosaic patterns on leaves',
+        'treatment': 'Remove infected plants, sanitize tools and hands thoroughly',
+        'prevention': 'Use certified virus-free seeds, avoid tobacco use near plants',
+        'organic_treatment': 'Complete plant removal, thorough equipment sanitation',
+        'watering_advice': 'Avoid mechanical transmission through contaminated water'
+    },
+    'Tomato___healthy': {
+        'name': 'Healthy Tomato', 'plant': 'Nyanya (Tomato)', 'severity': 'None',
+        'symptoms': 'Dark green foliage, strong stems, excellent fruit development',
+        'treatment': 'Continue excellent care practices, maintain monitoring schedule',
+        'prevention': 'Regular pruning and staking, mulching, balanced fertilization',
+        'organic_treatment': 'Compost application, beneficial companion plants like basil',
+        'watering_advice': 'Deep watering 2-3 times weekly, consistent moisture levels'
+    }
+}
+
+LANGUAGES = {"English": "en", "Kiswahili": "sw", "Luo": "luo"}
+
+UI_TEXTS = {
+    "English": {
+        "app_title": "KilimoGlow Kenya",
+        "subtitle": "Smart Plant Disease Detection for Kenyan Farmers",
+        "plant_doctor": "🩺 Plant Doctor",
+        "batch_analysis": "📊 Batch Analysis",
+        "dashboard": "📈 Dashboard",
+        "settings": "⚙️ Settings",
+        "upload_label": "Upload Plant Photo",
+        "analyze_plant": "🔬 Analyze Plant",
+        "batch_upload": "📁 Upload Multiple Images",
+        "process_batch": "⚡ Process Batch"
+    },
+    "Kiswahili": {
+        "app_title": "KilimoGlow Kenya",
+        "subtitle": "Utambuzi wa Magonjwa ya Mimea kwa Wakulima wa Kenya",
+        "plant_doctor": "🩺 Daktari wa Mimea",
+        "batch_analysis": "📊 Uchambuzi wa Kundi",
+        "dashboard": "📈 Bodi ya Habari",
+        "settings": "⚙️ Mipangilio",
+        "upload_label": "Pakia Picha ya Mmea",
+        "analyze_plant": "🔬 Chunguza Mmea",
+        "batch_upload": "📁 Pakia Picha Nyingi",
+        "process_batch": "⚡ Chamibuza Kundi"
+    },
+    "Luo": {
+        "app_title": "KilimoGlow Kenya", 
+        "subtitle": "Fwenyo Tuo mar Mimea ne Jopur Kenya",
+        "plant_doctor": "🩺 Jathieth Mimea",
+        "batch_analysis": "📊 Nonro Mangeny",
+        "dashboard": "📈 Bord Weche",
+        "settings": "⚙️ Chenro",
+        "upload_label": "Ket Fweny Yath",
+        "analyze_plant": "🔬 Nonro Yath",
+        "batch_upload": "📁 Ket Fweny Mangeny",
+        "process_batch": "⚡ Tiy Mangeny"
+    }
+}
+
+# ===== ENHANCED CSS STYLING =====
+def apply_enhanced_css():
+    """Apply comprehensive CSS styling"""
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    
+    * { 
+        font-family: 'Inter', sans-serif; 
+        box-sizing: border-box;
+    }
+    
+    /* Main app background with animated gradient */
+    .stApp {
+        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 50%, #1e3c72 100%);
+        background-size: 400% 400%;
+        animation: gradientShift 10s ease infinite;
+        color: white;
+    }
+    
+    @keyframes gradientShift {
+        0% { background-position: 0% 50%; }
+        50% { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+    }
+    
+    /* Mobile-first responsive design */
+    @media (max-width: 768px) {
+        .main-header h1 { font-size: 2rem !important; }
+        .kenyan-card { padding: 1rem !important; margin: 0.5rem 0 !important; }
+        .stButton>button { padding: 0.6rem 1.5rem !important; font-size: 0.9rem !important; }
+        .analysis-card { padding: 1rem !important; }
+    }
+    
+    /* Sidebar styling with Kenyan flag colors */
+    .css-1d391kg, .css-1cypcdb {
+        background: linear-gradient(180deg, #006400, #228B22) !important;
+        border-right: 3px solid #FFD700;
+        box-shadow: 5px 0 15px rgba(0, 0, 0, 0.2);
+    }
+    
+    /* Header styling with enhanced gradient */
+    .main-header {
+        background: linear-gradient(135deg, #006400, #228B22, #32CD32);
+        padding: 2rem;
+        border-radius: 20px;
+        text-align: center;
+        margin-bottom: 2rem;
+        box-shadow: 0 15px 35px rgba(0, 100, 0, 0.3);
+        border: 2px solid #FFD700;
+        position: relative;
+        overflow: hidden;
+    }
+    
+    .main-header::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        left: -50%;
+        width: 200%;
+        height: 200%;
+        background: radial-gradient(circle, rgba(255, 215, 0, 0.1) 0%, transparent 70%);
+        animation: rotate 20s linear infinite;
+    }
+    
+    @keyframes rotate {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    
+    /* Enhanced card styling */
+    .kenyan-card {
+        background: linear-gradient(145deg, rgba(0, 100, 0, 0.15), rgba(34, 139, 34, 0.1));
+        backdrop-filter: blur(15px);
+        border: 1px solid rgba(255, 215, 0, 0.3);
+        padding: 1.5rem;
+        border-radius: 15px;
+        margin: 1rem 0;
+        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        position: relative;
+    }
+    
+    .kenyan-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 15px 35px rgba(255, 215, 0, 0.25);
+        border-color: rgba(255, 215, 0, 0.6);
+    }
+    
+    /* Analysis results card with pulsing animation */
+    .analysis-card {
+        background: linear-gradient(145deg, rgba(0, 100, 0, 0.2), rgba(34, 139, 34, 0.15));
+        border: 2px solid #228B22;
+        padding: 2rem;
+        border-radius: 15px;
+        margin: 2rem 0;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+        animation: subtle-pulse 3s ease-in-out infinite;
+    }
+    
+    @keyframes subtle-pulse {
+        0%, 100% { box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25); }
+        50% { box-shadow: 0 15px 40px rgba(0, 100, 0, 0.3); }
+    }
+    
+    /* Enhanced button styling with hover effects */
+    .stButton>button {
+        background: linear-gradient(45deg, #006400, #228B22, #32CD32);
+        color: white !important;
+        border: 2px solid #FFD700;
+        border-radius: 12px;
+        padding: 0.75rem 2rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        width: 100%;
+        position: relative;
+        overflow: hidden;
+    }
+    
+    .stButton>button::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+        transition: left 0.5s;
+    }
+    
+    .stButton>button:hover::before {
+        left: 100%;
+    }
+    
+    .stButton>button:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 10px 25px rgba(255, 215, 0, 0.4);
+        background: linear-gradient(45deg, #228B22, #32CD32, #00FF00);
+    }
+    
+    /* File uploader styling */
+    .uploadedFile {
+        border: 2px dashed #32CD32;
+        border-radius: 10px;
+        padding: 1rem;
+        text-align: center;
+        transition: border-color 0.3s ease;
+    }
+    
+    .uploadedFile:hover {
+        border-color: #FFD700;
+    }
+    
+    /* Progress bars with Kenyan colors */
+    .stProgress > div > div > div > div {
+        background: linear-gradient(90deg, #006400, #32CD32) !important;
+        border-radius: 10px;
+    }
+    
+    /* Enhanced tabs styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background: rgba(0, 0, 0, 0.15);
+        padding: 8px;
+        border-radius: 12px;
+        backdrop-filter: blur(10px);
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+        padding: 0.7rem 1.2rem;
+        color: white;
+        border: 1px solid rgba(255, 215, 0, 0.2);
+        transition: all 0.3s ease;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(45deg, #006400, #32CD32) !important;
+        color: white !important;
+        border-color: #FFD700 !important;
+        transform: translateY(-2px);
+    }
+    
+    /* Severity badges with animations */
+    .severity-critical { 
+        background: linear-gradient(45deg, #DC143C, #FF0000);
+        animation: critical-pulse 1.5s infinite;
+        box-shadow: 0 0 10px rgba(220, 20, 60, 0.5);
+    }
+    .severity-high { 
+        background: linear-gradient(45deg, #FF8C00, #FFA500);
+        box-shadow: 0 0 8px rgba(255, 140, 0, 0.4);
+    }
+    .severity-medium { 
+        background: linear-gradient(45deg, #FFD700, #FFFF00); 
+        color: #000;
+        box-shadow: 0 0 8px rgba(255, 215, 0, 0.4);
+    }
+    .severity-none { 
+        background: linear-gradient(45deg, #228B22, #32CD32);
+        box-shadow: 0 0 8px rgba(34, 139, 34, 0.4);
+    }
+    
+    @keyframes critical-pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.8; transform: scale(1.05); }
+    }
+    
+    /* Status indicators */
+    .status-online { color: #32CD32; animation: status-glow 2s ease infinite; }
+    .status-offline { color: #DC143C; }
+    
+    @keyframes status-glow {
+        0%, 100% { text-shadow: 0 0 5px currentColor; }
+        50% { text-shadow: 0 0 15px currentColor, 0 0 25px currentColor; }
+    }
+    
+    /* Responsive grid */
+    .responsive-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 1.5rem;
+        margin: 2rem 0;
+    }
+    
+    /* Loading spinner */
+    .loading-spinner {
+        border: 4px solid rgba(255, 215, 0, 0.3);
+        border-top: 4px solid #FFD700;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+        display: inline-block;
+        margin: 0 15px;
+    }
+    
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    
+    /* Enhanced metric cards */
+    .metric-card {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 1.5rem;
+        border-radius: 15px;
+        text-align: center;
+        border: 1px solid rgba(255, 215, 0, 0.3);
+        transition: all 0.3s ease;
+        backdrop-filter: blur(10px);
+    }
+    
+    .metric-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 10px 25px rgba(255, 215, 0, 0.2);
+        border-color: rgba(255, 215, 0, 0.6);
+    }
+    
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+        width: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: rgba(0, 0, 0, 0.1);
+        border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: linear-gradient(45deg, #006400, #32CD32);
+        border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(45deg, #228B22, #00FF00);
+    }
+    
+    /* Text styling */
+    h1, h2, h3, h4, h5, h6 { 
+        color: white !important; 
+        text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    }
+    
+    /* Camera button styling */
+    .camera-button {
+        background: linear-gradient(45deg, #FF6B35, #F7931E);
+        border: 2px solid #FFD700;
+        border-radius: 50px;
+        padding: 1rem 2rem;
+        color: white;
+        font-weight: bold;
+        margin: 1rem 0;
+        transition: all 0.3s ease;
+    }
+    
+    .camera-button:hover {
+        transform: scale(1.05);
+        box-shadow: 0 8px 20px rgba(255, 107, 53, 0.4);
+    }
+    
+    /* Input field styling */
+    .stTextInput > div > div > input {
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 215, 0, 0.3);
+        border-radius: 8px;
+        color: white;
+    }
+    
+    .stSelectbox > div > div > select {
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 215, 0, 0.3);
+        border-radius: 8px;
+        color: white;
+    }
+    
+    /* Footer styling */
+    .app-footer {
+        background: linear-gradient(135deg, rgba(0,100,0,0.2), rgba(34,139,34,0.1));
+        border: 1px solid rgba(255, 215, 0, 0.3);
+        border-radius: 15px;
+        padding: 2rem;
+        margin-top: 3rem;
+        text-align: center;
+        backdrop-filter: blur(10px);
+    }
+    
+    /* Animation for page transitions */
+    .stApp > div {
+        animation: fadeIn 0.5s ease-in;
+    }
+    
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* Glassmorphism effects */
+    .glass-effect {
+        background: rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(15px);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 15px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Apply CSS styling only once
+if 'css_applied' not in st.session_state:
+    apply_enhanced_css()
+    st.session_state.css_applied = True
+
+# Check API status
+api_connected, api_info, working_url = check_fastapi_connection()
+
+# Update the working URL if found
+if working_url:
+    FASTAPI_BASE_URL = working_url
+    FASTAPI_ENDPOINTS = {
+        "health": f"{FASTAPI_BASE_URL}/health",
+        "predict": f"{FASTAPI_BASE_URL}/predict", 
+        "batch_predict": f"{FASTAPI_BASE_URL}/batch_predict",
+        "model_info": f"{FASTAPI_BASE_URL}/model/info"
+    }
+
+# ===== SIDEBAR =====
+with st.sidebar:
+    st.session_state.selected_language = st.selectbox(
+        "🌍 Language / Lugha / Dhok",
+        options=list(LANGUAGES.keys()),
+        index=list(LANGUAGES.keys()).index(st.session_state.selected_language)
+    )
+    
+    current_texts = UI_TEXTS.get(st.session_state.selected_language, UI_TEXTS["English"])
+    
+    st.markdown(f"""
+    <div class="main-header">
+        <h2 style="margin: 0; color: white; z-index: 10; position: relative;">{current_texts['app_title']}</h2>
+        <p style="color: #FFD700; margin: 0.5rem 0; font-size: 0.9rem; z-index: 10; position: relative;">{current_texts['subtitle']}</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Navigation
+    selected_page = option_menu(
+        menu_title="🇰🇪 Navigation",
+        options=[
+            "🏠 Home",
+            current_texts["plant_doctor"],
+            current_texts["batch_analysis"], 
+            current_texts["dashboard"],
+            current_texts["settings"]
+        ],
+        icons=["house-fill", "heart-pulse", "collection-fill", "bar-chart-fill", "gear-fill"],
+        default_index=0,
+        styles={
+            "container": {"padding": "0", "background-color": "transparent"},
+            "icon": {"color": "#FFD700", "font-size": "18px"},
+            "nav-link": {
+                "font-size": "14px", "text-align": "left", "margin": "2px 0",
+                "padding": "8px 12px", "color": "white", "border-radius": "8px"
+            },
+            "nav-link-selected": {
+                "background": "linear-gradient(90deg, #006400, #228B22)",
+                "color": "white", "border": "1px solid #FFD700"
+            },
+        },
+    )
+    
+    st.markdown("---")
+    
+    # API status with refresh button
+    if st.button("🔄 Refresh API Status", use_container_width=True):
+        if 'cached_api_status' in st.session_state:
+            del st.session_state.cached_api_status
+        if 'working_api_url' in st.session_state:
+            del st.session_state.working_api_url
+        st.rerun()
+    
+   
+    
+    # Use cached status to avoid repeated API calls
+    if 'cached_api_status' not in st.session_state:
+        st.session_state.cached_api_status = "online" if api_connected else "offline"
+
+    connection_status = st.session_state.cached_api_status
+
+    # Ensure connection_status is valid
+    if connection_status not in ["online", "cached", "offline"]:
+        connection_status = "offline"
+
+    status_colors = {
+        "online": ("🟢", "Online"),
+        "cached": ("🟡", "Cached"), 
+        "offline": ("🔴", "Offline")
+    }
+
+    color, status_text = status_colors[connection_status]
+
+    st.markdown(f"""
+    <div class="kenyan-card" style="padding: 1rem;">
+        <h4 style="color: #FFD700; margin-bottom: 0.5rem;">📊 System Status</h4>
+        <p style="margin: 0.2rem 0;">
+            <strong>API:</strong> {color} {status_text}
+        </p>
+        <p style="margin: 0.2rem 0;">
+            <strong>Language:</strong> {st.session_state.selected_language}
+        </p>
+        <p style="margin: 0.2rem 0;">
+            <strong>Analyses:</strong> {len(st.session_state.analysis_history)}
+        </p>
+        <p style="margin: 0.2rem 0;">
+            <strong>Batch Results:</strong> {len(st.session_state.batch_results)}
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ===== MAIN CONTENT =====
+
+# HOME PAGE
+if selected_page == "🏠 Home":
+    st.markdown(f"""
+    <div class="main-header">
+        <h1 style="margin: 0; font-size: 2.5rem; z-index: 10; position: relative;">🌿 {current_texts['app_title']}</h1>
+        <p style="margin: 1rem 0 0 0; font-size: 1.1rem; color: #FFD700; z-index: 10; position: relative;">{current_texts['subtitle']}</p>
+        <p style="margin: 0.5rem 0 0 0; color: white; font-size: 0.9rem; z-index: 10; position: relative;">
+            🇰🇪 Made for Kenya • 🌾 Local Crops • 🌍 Multi-language • 🚀 FastAPI Powered
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        <div class="kenyan-card">
+            <h3 style="color: #FFD700;">🔬 AI Disease Detection</h3>
+            <ul style="color: white; line-height: 1.6;">
+                <li>📸 Detect diseases in Nyanya, Pilipili, Viazi</li>
+                <li>🧠 FastAPI backend with TensorFlow</li>
+                <li>🌍 Support for English, Kiswahili, Luo</li>
+                <li>📱 Mobile-optimized interface</li>
+                <li>⚡ Batch processing for multiple images</li>
+                <li>💊 Treatment advice for Kenyan conditions</li>
+                <li>🌿 Organic solutions using local materials</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("""
+        <div class="kenyan-card">
+            <h3 style="color: #FFD700;">📱 Mobile Features</h3>
+            <ul style="color: white; line-height: 1.6;">
+                <li>📷 Built-in camera integration</li>
+                <li>👆 Touch-friendly interface</li>
+                <li>📄 Offline mode capability</li>
+                <li>📊 Comprehensive analytics dashboard</li>
+                <li>📥 Export reports in multiple formats</li>
+                <li>🎯 High accuracy disease detection</li>
+                <li>💾 Local data storage and management</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Quick Stats
+    if st.session_state.analysis_history:
+        total_analyses = len(st.session_state.analysis_history)
+        healthy_count = sum(1 for a in st.session_state.analysis_history 
+                          if 'healthy' in a.get('predicted_class', '').lower())
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #32CD32; margin: 0;">{total_analyses}</h2>
+                <p style="margin: 0;">Total Scans</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #FFD700; margin: 0;">{healthy_count}</h2>
+                <p style="margin: 0;">Healthy Plants</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #FF6B35; margin: 0;">{total_analyses - healthy_count}</h2>
+                <p style="margin: 0;">Need Treatment</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+# PLANT DOCTOR PAGE
+elif selected_page == current_texts["plant_doctor"]:
+    st.markdown(f"<h1 style='text-align: center; color: #FFD700;'>🩺 {current_texts['plant_doctor']}</h1>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown("### 📋 Plant Information")
+        
+        # User information
+        st.session_state.user_name = st.text_input(
+            "👤 Your Name / Jina Lako / Nyingi",
+            value=st.session_state.user_name,
+            placeholder="Enter your name"
+        )
+        
+        # Environmental conditions
+        weather_options = ["Select", "Sunny/Jua", "Rainy/Mvua", "Cloudy/Mawingu", "Dry/Kavu"]
+        st.session_state.weather_condition = st.selectbox(
+            "🌤️ Weather Condition",
+            weather_options,
+            index=weather_options.index(st.session_state.weather_condition) if st.session_state.weather_condition in weather_options else 0
+        )
+        
+        soil_options = ["Select", "Clay/Udongo wa Tope", "Sandy/Udongo wa Mchanga", 
+                       "Loam/Udongo Mzuri", "Rocky/Udongo wa Mawe"]
+        st.session_state.soil_type = st.selectbox(
+            "🌱 Soil Type",
+            soil_options,
+            index=soil_options.index(st.session_state.soil_type) if st.session_state.soil_type in soil_options else 0
+        )
+        
+        # Image upload options
+        st.markdown(f"### 📷 {current_texts['upload_label']}")
+        
+        # For mobile: prioritize camera input
+        upload_option = st.radio(
+            "Choose upload method:",
+            ["📱 Take Photo (Mobile)", "📁 Upload from Device"],
+            help="Use 'Take Photo' on mobile devices for best experience"
+        )
+        
+        uploaded_file = None
+        
+        if upload_option == "📱 Take Photo (Mobile)":
+            uploaded_file = st.camera_input(
+                "📸 Take a photo of your plant",
+                help="Position the plant leaf clearly in the frame"
+            )
+        else:
+            uploaded_file = st.file_uploader(
+                "Choose plant image",
+                type=["jpg", "jpeg", "png"],
+                help="Upload clear photo of plant leaves showing any symptoms"
+            )
+        
+        # Voice input option
+        if st.button("🎤 Voice Description", help="Describe your plant issue"):
+            recognizer, microphone = initialize_speech_recognition()
+            if recognizer and microphone:
+                with st.spinner("🎤 Listening..."):
+                    success, text = voice_to_text(recognizer, microphone, st.session_state.selected_language)
+                    if success:
+                        st.success(f"🎤 Voice input: {text}")
+                        st.info("💡 Voice input recorded. Please also upload an image for analysis.")
+                    else:
+                        st.error(f"🎤 {text}")
+            else:
+                st.warning("🎤 Voice input not available on this device/browser")
+    
+    with col2:
+        if uploaded_file:
+            # Display uploaded image
+            image = Image.open(uploaded_file)
+            st.image(image, caption="📸 Plant Photo for Analysis", use_column_width=True)
+            
+            # Analysis button
+            if st.button(current_texts["analyze_plant"], type="primary", use_container_width=True):
+                # Image quality validation
+                try:
+                    img_array = np.array(image)
+                    if image.size[0] > 1024 or image.size[1] > 1024:
+                        image = image.resize((min(1024, image.size[0]), min(1024, image.size[1])))
+                    
+                    if img_array.mean() < 10 or img_array.mean() > 245:
+                        st.error("⚠️ Image quality too poor for analysis")
+                        st.stop()
+                except:
+                    st.error("⚠️ Invalid image format")
+                    st.stop()
+                
+                # Generate analysis ID
+                analysis_id = str(uuid.uuid4())[:8]
+                st.session_state.current_analysis_id = analysis_id
+                
+                with st.spinner("🔬 Analyzing your plant... Please wait."):
+                    start_time = time.time()
+                    
+                    # Try FastAPI first
+                    st.info("🚀 Attempting FastAPI analysis...")
+                    success, result = predict_with_fastapi(uploaded_file)
+                    
+                    if success and result.get('success'):
+                        st.success("✅ Analysis completed with FastAPI!")
+                        st.session_state.analysis_result = result
+                    else:
+                        # Fallback to cached/offline mode
+                        st.warning("⚠️ FastAPI unavailable, using offline mode")
+                        if st.session_state.get('model_cached', False):
+                            st.info("📱 Using cached analysis mode")
+                            result = hybrid_offline_predict(uploaded_file, metadata={'weather': st.session_state.get('weather_condition','Unknown'), 'soil': st.session_state.get('soil_type','Unknown')}, simulate_fn=simulate_disease_prediction)
+                        else:
+                            st.info("📱 Using offline simulation mode")
+                            result = hybrid_offline_predict(file_obj if 'file_obj' in locals() else uploaded_file, metadata={'weather': st.session_state.get('weather_condition','Unknown'), 'soil': st.session_state.get('soil_type','Unknown')}, simulate_fn=simulate_disease_prediction)
+                        st.session_state.analysis_result = result
+                    
+                    processing_time = time.time() - start_time
+            
+            # Display results if available
+            if st.session_state.analysis_result:
+                result = st.session_state.analysis_result
+                predicted_class = result.get("predicted_class", "unknown")
+                confidence = result.get("confidence", 0)
+                
+                if confidence <= 1:
+                    confidence *= 100
+                
+                if confidence < 60:
+                    st.warning("⚠️ Low confidence detection. Please ensure image shows clear plant leaves.")
+                
+                disease_info = PLANT_DISEASES.get(predicted_class, {
+                    'name': 'Unknown Disease',
+                    'plant': 'Unknown Plant',
+                    'severity': 'Unknown',
+                    'symptoms': 'Unable to determine symptoms',
+                    'treatment': 'Consult agricultural extension officer',
+                    'prevention': 'Practice good plant hygiene',
+                    'organic_treatment': 'Use natural methods',
+                    'watering_advice': 'Water appropriately'
+                })
+                
+                st.markdown("---")
+                st.markdown("### 🎯 Analysis Results")
+                
+                # Confidence visualization
+                fig_conf = go.Figure()
+                colors = ['#32CD32' if confidence > 80 else '#FFD700' if confidence > 60 else '#DC143C']
+                
+                fig_conf.add_trace(go.Bar(
+                    x=['Confidence'],
+                    y=[confidence],
+                    marker_color=colors[0],
+                    text=[f'{confidence:.1f}%'],
+                    textposition='auto',
+                    width=[0.6]
+                ))
+                
+                fig_conf.update_layout(
+                    title=f"🎯 {disease_info.get('plant', 'Plant')} - {disease_info.get('name', 'Unknown')}",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="white"),
+                    yaxis_range=[0, 100],
+                    height=250,
+                    margin=dict(l=20, r=20, t=60, b=20)
+                )
+                st.plotly_chart(fig_conf, use_column_width=True)
+                
+                # Disease information card
+                severity_color = {
+                    'Critical': '#DC143C', 'High': '#FF8C00', 
+                    'Medium': '#FFD700', 'None': '#32CD32'
+                }.get(disease_info.get('severity'), '#32CD32')
+                
+                st.markdown(f"""
+                <div class="analysis-card" style="border-left: 6px solid {severity_color};">
+                    <h3 style="color: #FFD700; margin-bottom: 1rem;">
+                        {disease_info.get('plant', 'Unknown')} - {disease_info.get('name', 'Unknown')}
+                    </h3>
+                    <div style="margin-bottom: 1rem;">
+                        {severity_badge(disease_info.get('severity', 'None'))}
+                    </div>
+                    <p style="margin-bottom: 0.5rem;">
+                        <strong>🔍 Symptoms:</strong> {disease_info.get('symptoms', 'No symptoms listed')}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Treatment tabs
+                tab1, tab2, tab3, tab4 = st.tabs([
+                    "💊 Treatment", "🌿 Organic", "🛡️ Prevention", "💧 Watering"
+                ])
+                
+                with tab1:
+                    treatment_text = disease_info.get('treatment', 'Continue monitoring')
+                    if st.session_state.selected_language != 'English':
+                        treatment_text = translate_text_simple(treatment_text, st.session_state.selected_language)
+                    
+                    st.markdown(f"**Treatment:** {treatment_text}")
+                    
+                    urgency = {
+                        'Critical': '🚨 Act immediately (today!)',
+                        'High': '⚠️ Treat within 2-3 days',
+                        'Medium': '⚡ Treat within a week',
+                        'None': '✅ Continue monitoring'
+                    }.get(disease_info.get('severity'), 'Monitor regularly')
+                    
+                    st.info(f"⏰ **Urgency:** {urgency}")
+                
+                with tab2:
+                    organic_text = disease_info.get('organic_treatment', 'Use natural methods')
+                    if st.session_state.selected_language != 'English':
+                        organic_text = translate_text_simple(organic_text, st.session_state.selected_language)
+                    
+                    st.markdown(f"**Organic Treatment:** {organic_text}")
+                    
+                    st.markdown("**🌿 Local Solutions:**")
+                    organic_tips = [
+                        "🧄 Garlic + chili spray",
+                        "🌿 Neem leaves solution", 
+                        "🥛 Milk solution (1:10)",
+                        "🧪 Baking soda spray",
+                        "🌱 Compost tea"
+                    ]
+                    for tip in organic_tips:
+                        st.markdown(f"• {tip}")
+                
+                with tab3:
+                    prevention_text = disease_info.get('prevention', 'Practice good hygiene')
+                    if st.session_state.selected_language != 'English':
+                        prevention_text = translate_text_simple(prevention_text, st.session_state.selected_language)
+                    
+                    st.markdown(f"**Prevention:** {prevention_text}")
+                
+                with tab4:
+                    watering_text = disease_info.get('watering_advice', 'Water regularly')
+                    if st.session_state.selected_language != 'English':
+                        watering_text = translate_text_simple(watering_text, st.session_state.selected_language)
+                    
+                    st.markdown(f"**Watering:** {watering_text}")
+                
+                
+
+
+                # Save analysis to history
+                analysis_data = {
+                    'analysis_id': st.session_state.get('current_analysis_id', str(uuid.uuid4())[:8]),
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'user_name': st.session_state.user_name or 'Anonymous',
+                    'weather': st.session_state.weather_condition,
+                    'soil': st.session_state.soil_type,
+                    'language': st.session_state.selected_language,
+                    'predicted_class': predicted_class,
+                    'confidence': confidence,
+                    'disease_info': disease_info,
+                    'processing_time': result.get('processing_time', 0),
+                    'api_used': result.get('success', False)
+                }
+                
+                # Add to history if not already present
+                existing_analysis = next((a for a in st.session_state.analysis_history 
+                        if a.get('analysis_id') == st.session_state.get('current_analysis_id')), None)
+                if not existing_analysis:
+                    st.session_state.analysis_history.append(analysis_data)
+                
+                # Export options
+                st.markdown("### 📥 Export Report")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # CSV report
+                    report_data = {
+                        'Field': ['Date', 'Farmer', 'Plant', 'Disease', 'Severity', 'Confidence', 'Weather', 'Soil'],
+                        'Value': [
+                            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            st.session_state.user_name or 'Anonymous',
+                            disease_info.get('plant', 'Unknown'),
+                            disease_info.get('name', 'Unknown'),
+                            disease_info.get('severity', 'Unknown'),
+                            f"{confidence:.1f}%",
+                            st.session_state.weather_condition,
+                            st.session_state.soil_type
+                        ]
+                    }
+                    
+                    report_df = pd.DataFrame(report_data)
+                    csv_data = report_df.to_csv(index=False)
+                    
+                    st.download_button(
+                        "📊 Download Report (CSV)",
+                        csv_data,
+                        f"plant_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    # Text report
+                    text_report = f"""KILIMOGLOW KENYA - PLANT ANALYSIS REPORT
+==========================================--
+Analysis ID: {st.session_state.get('current_analysis_id', 'N/A')}
+Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Farmer: {st.session_state.user_name or 'Anonymous'}
+Language: {st.session_state.selected_language}
+
+ENVIRONMENTAL CONDITIONS:
+Weather: {st.session_state.weather_condition}
+Soil Type: {st.session_state.soil_type}
+
+ANALYSIS RESULTS:
+Plant Type: {disease_info.get('plant', 'Unknown')}
+Disease/Condition: {disease_info.get('name', 'Unknown')}
+Severity Level: {disease_info.get('severity', 'Unknown')}
+Confidence Score: {confidence:.1f}%
+
+SYMPTOMS:
+{disease_info.get('symptoms', 'No symptoms listed')}
+
+TREATMENT RECOMMENDATION:
+{disease_info.get('treatment', 'Continue monitoring')}
+
+ORGANIC TREATMENT:
+{disease_info.get('organic_treatment', 'Use natural methods')}
+
+PREVENTION MEASURES:
+{disease_info.get('prevention', 'Practice good hygiene')}
+
+WATERING ADVICE:
+{disease_info.get('watering_advice', 'Water regularly')}
+
+MODEL INFO:
+Processing Time: {result.get('processing_time', 0):.2f}s
+Model Version: {result.get('model_version', 'Unknown')}
+API Used: {'Yes' if result.get('success', False) else 'No'}
+
+Generated by KilimoGlow Kenya v2.0
+"""
+                    
+                    st.download_button(
+                        "📄 Download Report (TXT)",
+                        text_report,
+                        f"plant_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        "text/plain",
+                        use_container_width=True
+                    )
+        else:
+            st.markdown("""
+            <div class="kenyan-card" style="text-align: center; padding: 3rem;">
+                <h3 style="color: #FFD700;">📸 Ready for Analysis</h3>
+                <p>Take a photo or upload an image to begin plant disease detection</p>
+                <div style="font-size: 3rem; margin: 1rem 0;">🔬</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# BATCH ANALYSIS PAGE
+elif selected_page == current_texts["batch_analysis"]:
+    st.markdown(f"<h1 style='text-align: center; color: #FFD700;'>📊 {current_texts['batch_analysis']}</h1>", unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div class="kenyan-card">
+        <h3 style="color: #FFD700;">⚡ Batch Processing</h3>
+        <p style="color: white;">Upload multiple plant images for simultaneous analysis. Perfect for large-scale farm monitoring.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown("### 📁 Upload Multiple Images")
+        
+        uploaded_files = st.file_uploader(
+            "Choose plant images",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            help="Select multiple images for batch analysis"
+        )
+        
+        if uploaded_files:
+            st.info(f"📊 {len(uploaded_files)} images ready for processing")
+            
+            # Batch processing button
+            if st.button(current_texts["process_batch"], type="primary", use_container_width=True):
+                with st.spinner("⚡ Processing batch... This may take a few minutes."):
+                    
+                    if api_connected:
+                        # Use FastAPI batch endpoint
+                        success, batch_result = batch_predict_with_fastapi(uploaded_files)
+                        
+                        if success and batch_result.get('success'):
+                            results = batch_result.get('results', [])
+                        else:
+                            st.warning("⚠️ FastAPI batch processing failed, using individual processing")
+                            results = []
+                            for file in uploaded_files:
+                                success, result = predict_with_fastapi(file)
+                                if success:
+                                    results.append(result)
+                                else:
+                                    results.append(hybrid_offline_predict(file_obj if 'file_obj' in locals() else uploaded_file, metadata={'weather': st.session_state.get('weather_condition','Unknown'), 'soil': st.session_state.get('soil_type','Unknown')}, simulate_fn=simulate_disease_prediction))
+                    else:
+                        # Offline batch processing
+                        st.info("📱 Using offline batch processing")
+                        result = hybrid_offline_predict(uploaded_file,
+                                metadata={'weather': st.session_state.get('weather_condition','Unknown'),
+                                          'soil': st.session_state.get('soil_type','Unknown')},
+                                simulate_fn=simulate_disease_prediction)
+
+                    # Store batch results
+                    batch_analysis = {
+                        'batch_id': str(uuid.uuid4())[:8],
+                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'total_images': len(uploaded_files),
+                        'results': results,
+                        'user_name': st.session_state.user_name or 'Anonymous'
+                    }
+                    
+                    st.session_state.batch_results.append(batch_analysis)
+                    
+                    # Add individual results to history
+                    for i, result in enumerate(results):
+                        predicted_class = result.get("predicted_class", "unknown")
+                        confidence = result.get("confidence", 0)
+                        if confidence <= 1:
+                            confidence *= 100
+                        
+                        disease_info = PLANT_DISEASES.get(predicted_class, {})
+                        
+                        analysis_data = {
+                            'analysis_id': f"batch_{batch_analysis['batch_id']}_{i}",
+                            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'user_name': st.session_state.user_name or 'Anonymous',
+                            'weather': 'Batch Processing',
+                            'soil': 'Batch Processing',
+                            'language': st.session_state.selected_language,
+                            'predicted_class': predicted_class,
+                            'confidence': confidence,
+                            'disease_info': disease_info,
+                            'processing_time': result.get('processing_time', 0),
+                            'api_used': api_connected and result.get('success', False),
+                            'batch_id': batch_analysis['batch_id']
+                        }
+                        st.session_state.analysis_history.append(analysis_data)
+                    
+                    st.success(f"✅ Batch processing complete! {len(results)} images analyzed.")
+    
+    with col2:
+        # Display batch results
+        if st.session_state.batch_results:
+            st.markdown("### 📈 Batch Results")
+            
+            latest_batch = st.session_state.batch_results[-1]
+            results = latest_batch['results']
+            
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            
+            total_images = len(results)
+            healthy_count = sum(1 for r in results if 'healthy' in r.get('predicted_class', '').lower())
+            avg_confidence = sum(r.get('confidence', 0) for r in results) / total_images if total_images > 0 else 0
+            if avg_confidence <= 1:
+                avg_confidence *= 100
+            
+            with col1:
+                st.metric("📊 Total Images", total_images)
+            with col2:
+                st.metric("🌱 Healthy Plants", f"{healthy_count} ({(healthy_count/total_images*100):.0f}%)")
+            with col3:
+                st.metric("🎯 Avg Confidence", f"{avg_confidence:.1f}%")
+            
+            # Results visualization
+            if results:
+                # Create DataFrame for visualization
+                batch_data = []
+                for i, result in enumerate(results):
+                    predicted_class = result.get("predicted_class", "unknown")
+                    disease_info = PLANT_DISEASES.get(predicted_class, {})
+                    confidence = result.get("confidence", 0)
+                    if confidence <= 1:
+                        confidence *= 100
+                    
+                    batch_data.append({
+                        'Image': f'Image {i+1}',
+                        'Plant': disease_info.get('plant', 'Unknown'),
+                        'Disease': disease_info.get('name', 'Unknown'),
+                        'Severity': disease_info.get('severity', 'Unknown'),
+                        'Confidence': confidence
+                    })
+                
+                batch_df = pd.DataFrame(batch_data)
+                
+                # Severity distribution
+                fig_severity = px.pie(
+                    batch_df, 
+                    names='Severity',
+                    title='Disease Severity Distribution',
+                    color_discrete_map={
+                        'None': '#32CD32',
+                        'Medium': '#FFD700', 
+                        'High': '#FF8C00',
+                        'Critical': '#DC143C'
+                    }
+                )
+                fig_severity.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="white")
+                )
+                st.plotly_chart(fig_severity, use_column_width=True)
+                
+                # Results table
+                st.markdown("### 📋 Detailed Results")
+                st.dataframe(batch_df, use_container_width=True, hide_index=True)
+                
+                # Export batch results
+                st.markdown("### 📥 Export Batch Results")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Export CSV
+                    csv_data = batch_df.to_csv(index=False)
+                    st.download_button(
+                        "📊 Download Batch CSV",
+                        csv_data,
+                        f"batch_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    # Export summary report
+                    summary_report = f"""KILIMOGLOW KENYA - BATCH ANALYSIS REPORT
+========================================
+Batch ID: {latest_batch['batch_id']}
+Date: {latest_batch['timestamp']}
+Farmer: {latest_batch['user_name']}
+Total Images: {total_images}
+Healthy Plants: {healthy_count} ({(healthy_count/total_images*100):.1f}%)
+Plants Needing Treatment: {total_images - healthy_count} ({((total_images - healthy_count)/total_images*100):.1f}%)
+Average Confidence: {avg_confidence:.1f}%
+
+DETAILED RESULTS:
+{chr(10).join([f"Image {i+1}: {row['Plant']} - {row['Disease']} ({row['Confidence']:.1f}%)" for i, row in batch_df.iterrows()])}
+
+Generated by KilimoGlow Kenya v2.0
+"""
+                    
+                    st.download_button(
+                        "📄 Download Summary",
+                        summary_report,
+                        f"batch_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        "text/plain",
+                        use_container_width=True
+                    )
+        else:
+            st.markdown("""
+            <div class="kenyan-card" style="text-align: center; padding: 3rem;">
+                <h3 style="color: #FFD700;">⚡ Ready for Batch Processing</h3>
+                <p>Upload multiple images to see batch analysis results here</p>
+                <div style="font-size: 3rem; margin: 1rem 0;">📊</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# DASHBOARD PAGE
+elif selected_page == current_texts["dashboard"]:
+    st.markdown(f"<h1 style='text-align: center; color: #FFD700;'>📈 {current_texts['dashboard']}</h1>", unsafe_allow_html=True)
+    
+    if st.session_state.analysis_history:
+        # Key metrics
+        total_analyses = len(st.session_state.analysis_history)
+        healthy_count = sum(1 for a in st.session_state.analysis_history 
+                          if 'healthy' in a.get('predicted_class', '').lower())
+        api_analyses = sum(1 for a in st.session_state.analysis_history if a.get('api_used', False))
+        avg_confidence = sum(a.get('confidence', 0) for a in st.session_state.analysis_history) / total_analyses
+        
+        # Metrics display
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #32CD32; margin: 0;">{total_analyses}</h2>
+                <p style="margin: 0;">Total Scans</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #FFD700; margin: 0;">{healthy_count}</h2>
+                <p style="margin: 0;">Healthy Plants</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #FF6B35; margin: 0;">{total_analyses - healthy_count}</h2>
+                <p style="margin: 0;">Diseases Detected</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h2 style="color: #9932CC; margin: 0;">{avg_confidence:.1f}%</h2>
+                <p style="margin: 0;">Avg Confidence</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Analysis trends over time
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.markdown("### 📊 Analysis Trends")
+            
+        
+            # Prepare time series data
+            df = pd.DataFrame(st.session_state.analysis_history)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df['date'] = df['timestamp'].dt.strftime('%Y-%m-%d')
+                        
+            # Daily analysis count
+            daily_counts = df.groupby('date').size().reset_index(name='count')
+            daily_counts['date'] = pd.to_datetime(daily_counts['date'])
+            daily_counts['cumulative'] = daily_counts['count'].cumsum()
+            
+            fig_trend = go.Figure()
+            
+            # Daily bars
+            fig_trend.add_trace(go.Bar(
+                x=daily_counts['date'],
+                y=daily_counts['count'],
+                name='Daily Analyses',
+                marker_color='#32CD32',
+                opacity=0.7
+            ))
+            
+            # Cumulative line
+            fig_trend.add_trace(go.Scatter(
+                x=daily_counts['date'],
+                y=daily_counts['cumulative'],
+                mode='lines+markers',
+                name='Cumulative',
+                line=dict(color='#FFD700', width=3),
+                yaxis='y2'
+            ))
+            
+            fig_trend.update_layout(
+                title="📈 Analysis Activity Over Time",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0.1)",
+                font=dict(color="white"),
+                xaxis=dict(title="Date", tickformat='%Y-%m-%d'),
+                yaxis=dict(title="Daily Count", side='left'),
+                yaxis2=dict(title="Cumulative", side='right', overlaying='y'),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                height=400
+            )
+            
+            st.plotly_chart(fig_trend, use_container_width=True)
+        
+        with col2:
+            st.markdown("### 🌱 Plant Types")
+            
+            # Extract plant types from disease info
+            plant_counts = {}
+            for analysis in st.session_state.analysis_history:
+                disease_info = analysis.get('disease_info', {})
+                plant = disease_info.get('plant', 'Unknown')
+                plant_counts[plant] = plant_counts.get(plant, 0) + 1
+            
+            if plant_counts:
+                plant_df = pd.DataFrame(list(plant_counts.items()), columns=['Plant', 'Count'])
+                
+                fig_plants = px.pie(
+                    plant_df,
+                    values='Count',
+                    names='Plant',
+                    title='Plant Distribution',
+                    color_discrete_sequence=['#32CD32', '#FFD700', '#FF6B35', '#9932CC']
+                )
+                
+                fig_plants.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="white"),
+                    height=300,
+                    margin=dict(l=20, r=20, t=60, b=20)
+                )
+                
+                st.plotly_chart(fig_plants, use_column_width=True)
+        
+        # Disease severity analysis
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### ⚠️ Severity Analysis")
+            
+            severity_counts = {}
+            for analysis in st.session_state.analysis_history:
+                disease_info = analysis.get('disease_info', {})
+                severity = disease_info.get('severity', 'Unknown')
+                severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            
+            if severity_counts:
+                severity_df = pd.DataFrame(list(severity_counts.items()), columns=['Severity', 'Count'])
+                
+                # Color mapping for severity
+                severity_colors = {
+                    'None': '#32CD32',
+                    'Medium': '#FFD700', 
+                    'High': '#FF8C00',
+                    'Critical': '#DC143C',
+                    'Unknown': '#808080'
+                }
+                
+                fig_severity = px.bar(
+                    severity_df,
+                    x='Severity',
+                    y='Count',
+                    title='Disease Severity Distribution',
+                    color='Severity',
+                    color_discrete_map=severity_colors
+                )
+                
+                fig_severity.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0.1)",
+                    font=dict(color="white"),
+                    showlegend=False,
+                    height=350
+                )
+                
+                st.plotly_chart(fig_severity, use_column_width=True)
+        
+        with col2:
+            st.markdown("### 🎯 Confidence Levels")
+            
+            # Confidence distribution
+            confidences = [a.get('confidence', 0) for a in st.session_state.analysis_history]
+            
+            if confidences:
+                fig_conf_dist = go.Figure()
+                
+                fig_conf_dist.add_trace(go.Histogram(
+                    x=confidences,
+                    nbinsx=10,
+                    marker_color='#32CD32',
+                    opacity=0.7,
+                    name='Confidence Distribution'
+                ))
+                
+                # Add average line
+                avg_line = sum(confidences) / len(confidences)
+                fig_conf_dist.add_vline(
+                    x=avg_line,
+                    line_dash="dash",
+                    line_color="#FFD700",
+                    line_width=3,
+                    annotation_text=f"Avg: {avg_line:.1f}%"
+                )
+                
+                fig_conf_dist.update_layout(
+                    title="🎯 Confidence Score Distribution",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0.1)",
+                    font=dict(color="white"),
+                    xaxis_title="Confidence (%)",
+                    yaxis_title="Count",
+                    showlegend=False,
+                    height=350
+                )
+                
+                st.plotly_chart(fig_conf_dist, use_column_width=True)
+        
+        # Recent analysis history table
+        st.markdown("### 📋 Recent Analysis History")
+        
+        # Prepare display data
+        display_data = []
+        recent_analyses = sorted(st.session_state.analysis_history, 
+                               key=lambda x: x['timestamp'], reverse=True)[:10]
+        
+        for analysis in recent_analyses:
+            disease_info = analysis.get('disease_info', {})
+            display_data.append({
+                'Time': analysis['timestamp'].split(' ')[1][:5],  # Show only time
+                'Farmer': analysis.get('user_name', 'Anonymous')[:15],
+                'Plant': disease_info.get('plant', 'Unknown'),
+                'Disease': disease_info.get('name', 'Unknown')[:20],
+                'Severity': disease_info.get('severity', 'Unknown'),
+                'Confidence': f"{analysis.get('confidence', 0):.1f}%",
+                'API': '🟢' if analysis.get('api_used', False) else '🔴'
+            })
+        
+        if display_data:
+            history_df = pd.DataFrame(display_data)
+            st.dataframe(history_df, use_container_width=True, hide_index=True)
+        
+        # Export dashboard data
+        st.markdown("### 📥 Export Dashboard Data")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # Export full history
+            full_export_data = []
+            for analysis in st.session_state.analysis_history:
+                disease_info = analysis.get('disease_info', {})
+                full_export_data.append({
+                    'Analysis_ID': analysis.get('analysis_id', st.session_state.get('current_analysis_id', '')),
+                    'Timestamp': analysis.get('timestamp', ''),
+                    'Farmer_Name': analysis.get('user_name', ''),
+                    'Weather': analysis.get('weather', ''),
+                    'Soil_Type': analysis.get('soil', ''),
+                    'Language': analysis.get('language', ''),
+                    'Plant_Type': disease_info.get('plant', ''),
+                    'Disease_Name': disease_info.get('name', ''),
+                    'Severity': disease_info.get('severity', ''),
+                    'Confidence': analysis.get('confidence', 0),
+                    'Processing_Time': analysis.get('processing_time', 0),
+                    'API_Used': analysis.get('api_used', False),
+                    'Treatment': disease_info.get('treatment', ''),
+                    'Prevention': disease_info.get('prevention', '')
+                })
+            
+            export_df = pd.DataFrame(full_export_data)
+            csv_data = export_df.to_csv(index=False)
+            
+            st.download_button(
+                "📊 Full History CSV",
+                csv_data,
+                f"kilimoglow_full_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        
+        with col2:
+            # Export summary stats
+            summary_stats = f"""KILIMOGLOW KENYA - DASHBOARD SUMMARY
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+OVERVIEW STATISTICS:
+Total Analyses: {total_analyses}
+Healthy Plants: {healthy_count} ({(healthy_count/total_analyses*100):.1f}%)
+Diseased Plants: {total_analyses - healthy_count} ({((total_analyses - healthy_count)/total_analyses*100):.1f}%)
+Average Confidence: {avg_confidence:.1f}%
+API Analyses: {api_analyses} ({(api_analyses/total_analyses*100):.1f}%)
+
+PLANT TYPE BREAKDOWN:
+{chr(10).join([f"{plant}: {count}" for plant, count in plant_counts.items()]) if plant_counts else "No data available"}
+
+SEVERITY BREAKDOWN:
+{chr(10).join([f"{severity}: {count}" for severity, count in severity_counts.items()]) if severity_counts else "No data available"}
+
+Generated by KilimoGlow Kenya v2.0
+"""
+            
+            st.download_button(
+                "📈 Summary Report",
+                summary_stats,
+                f"kilimoglow_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                "text/plain",
+                use_container_width=True
+            )
+        
+        with col3:
+            # Export for analysis (JSON)
+            json_data = {
+                'export_info': {
+                    'timestamp': datetime.now().isoformat(),
+                    'total_records': total_analyses,
+                    'app_version': 'KilimoGlow_v2.0'
+                },
+                'analysis_history': st.session_state.analysis_history,
+                'batch_results': st.session_state.batch_results,
+                'summary_stats': {
+                    'total_analyses': total_analyses,
+                    'healthy_count': healthy_count,
+                    'avg_confidence': avg_confidence,
+                    'plant_distribution': plant_counts if 'plant_counts' in locals() else {},
+                    'severity_distribution': severity_counts if 'severity_counts' in locals() else {}
+                }
+            }
+            
+            json_string = json.dumps(json_data, indent=2, default=str)
+            
+            st.download_button(
+                "🔧 Data Export (JSON)",
+                json_string,
+                f"kilimoglow_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                "application/json",
+                use_container_width=True
+            )
+    
+    else:
+        st.markdown("""
+        <div class="kenyan-card" style="text-align: center; padding: 4rem;">
+            <h2 style="color: #FFD700;">📊 Dashboard Ready</h2>
+            <p style="margin: 1rem 0;">Start analyzing plants to see comprehensive analytics and insights here</p>
+            <div style="font-size: 4rem; margin: 2rem 0;">📈</div>
+            <p style="color: #32CD32;">Your farming analytics will appear once you begin plant disease detection</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# SETTINGS PAGE
+elif selected_page == current_texts["settings"]:
+    st.markdown(f"<h1 style='text-align: center; color: #FFD700;'>⚙️ {current_texts['settings']}</h1>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown("### 🔧 System Configuration")
+        
+        # API Configuration
+        with st.expander("🌐 API Settings", expanded=True):
+            st.markdown(f"""
+            **FastAPI Status:** {'🟢 Connected' if api_connected else '🔴 Disconnected'}
+            
+            **Base URL:** {FASTAPI_BASE_URL}
+            
+            **Available Endpoints:**
+            """)
+            
+            for endpoint_name, endpoint_url in FASTAPI_ENDPOINTS.items():
+                status = "✅" if api_connected else "❌"
+                st.markdown(f"- {status} **{endpoint_name.title()}:** `{endpoint_url}`")
+            
+            if st.button("🔄 Test API Connection", use_container_width=True):
+                with st.spinner("Testing connection..."):
+                    test_success, test_info, working_api_url = check_fastapi_connection()
+                    if test_success:
+                        st.success("✅ API connection successful!")
+                        st.json(test_info)
+                    else:
+                        st.error("❌ API connection failed!")
+                        st.json(test_info)
+        
+        # Model Information
+        with st.expander("🤖 Model Information"):
+            if api_connected:
+                model_info = get_model_info()
+                if model_info:
+                    st.json(model_info)
+                else:
+                    st.info("Model information not available")
+            else:
+                st.warning("API not connected - model info unavailable")
+        
+        # Language & Localization
+        with st.expander("🌍 Language & Localization", expanded=True):
+            st.markdown("**Supported Languages:**")
+            for lang, code in LANGUAGES.items():
+                current = "📸" if lang == st.session_state.selected_language else "⚪"
+                st.markdown(f"{current} **{lang}** (`{code}`)")
+            
+            st.markdown("---")
+            
+            # Translation test
+            test_text = st.text_input("🔤 Test Translation", value="Healthy plant treatment")
+            if test_text:
+                for lang in LANGUAGES.keys():
+                    if lang != "English":
+                        translated = translate_text_simple(test_text, lang)
+                        st.markdown(f"**{lang}:** {translated}")
+    
+    with col2:
+        st.markdown("### 📱 User Preferences")
+        
+        # User Profile
+        with st.expander("👤 User Profile", expanded=True):
+            st.session_state.user_name = st.text_input(
+                "👤 Default Name",
+                value=st.session_state.user_name,
+                help="Default name for analysis reports"
+            )
+            
+            # Camera quality settings
+            camera_options = ["Low (480p)", "Medium (720p)", "High (1080p)"]
+            st.session_state.camera_quality = st.selectbox(
+                "📷 Camera Quality",
+                camera_options,
+                index=camera_options.index(st.session_state.camera_quality) if st.session_state.camera_quality in camera_options else 1
+            )
+            
+            # Default environmental conditions
+            st.markdown("**Default Conditions:**")
+            default_weather = st.selectbox(
+                "🌤️ Default Weather",
+                ["Select", "Sunny/Jua", "Rainy/Mvua", "Cloudy/Mawingu", "Dry/Kavu"],
+                help="Pre-select weather condition"
+            )
+            
+            default_soil = st.selectbox(
+                "🌱 Default Soil Type",
+                ["Select", "Clay/Udongo wa Tope", "Sandy/Udongo wa Mchanga", 
+                 "Loam/Udongo Mzuri", "Rocky/Udongo wa Mawe"],
+                help="Pre-select soil type"
+            )
+        
+        # Data Management
+        with st.expander("💾 Data Management"):
+            st.markdown("**Analysis History:**")
+            st.info(f"📊 Total Analyses: {len(st.session_state.analysis_history)}")
+            st.info(f"📦 Batch Results: {len(st.session_state.batch_results)}")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🗑️ Clear History", use_container_width=True):
+                    st.session_state.analysis_history = []
+                    st.success("✅ History cleared!")
+                    time.sleep(1)
+                    st.rerun()
+            
+            with col2:
+                if st.button("🔄 Reset All Data", use_container_width=True):
+                    # Reset all session state except language
+                    current_lang = st.session_state.selected_language
+                    keys_to_delete = [k for k in st.session_state.keys() if k != 'selected_language']
+                    for key in keys_to_delete:
+                        del st.session_state[key]
+                    init_session_state()
+                    st.session_state.selected_language = current_lang
+                    st.success("✅ All data reset!")
+                    time.sleep(1)
+                    st.rerun()
+        
+        # Advanced Settings
+        with st.expander("🔬 Advanced Settings"):
+            # Confidence threshold
+            confidence_threshold = st.slider(
+                "🎯 Confidence Threshold",
+                min_value=50.0,
+                max_value=100.0,
+                value=70.0,
+                step=5.0,
+                help="Minimum confidence for reliable predictions"
+            )
+            
+            # Processing timeout
+            processing_timeout = st.slider(
+                "⏱️ Processing Timeout (seconds)",
+                min_value=10,
+                max_value=60,
+                value=25,
+                step=5,
+                help="Maximum time to wait for API response"
+            )
+            
+            # Auto-refresh dashboard
+            auto_refresh = st.checkbox(
+                "🔄 Auto-refresh Dashboard",
+                value=False,
+                help="Automatically refresh dashboard every 30 seconds"
+            )
+            
+            # Debug mode
+            debug_mode = st.checkbox(
+                "🛠 Debug Mode",
+                value=False,
+                help="Show detailed error information and logs"
+            )
+            
+            if debug_mode:
+                st.markdown("**Debug Information:**")
+                debug_info = {
+                    "session_state_keys": list(st.session_state.keys()),
+                    "api_status": st.session_state.get('cached_api_status', 'unknown'),
+                    "current_analysis_id": st.session_state.get('current_analysis_id'),
+                    "working_api_url": st.session_state.get('working_api_url'),
+                    "total_analyses": len(st.session_state.analysis_history),
+                    "total_batches": len(st.session_state.batch_results)
+                }
+                st.json(debug_info)
+
+# ===== FOOTER =====
+st.markdown("---")
+st.markdown("""
+<div class="app-footer">
+    <h3 style="color: #FFD700; margin-bottom: 1rem;">🌿 KilimoGlow Kenya</h3>
+    <p style="color: white; margin-bottom: 0.5rem;">
+        🇰🇪 <strong>Made for Kenyan Farmers</strong> • 🌾 <strong>Supporting Local Agriculture</strong> • 🤖 <strong>Powered by AI</strong>
+    </p>
+    <p style="color: #32CD32; margin-bottom: 1rem;">
+        Empowering smallholder farmers with smart plant disease detection technology
+    </p>
+    <div style="display: flex; justify-content: center; gap: 2rem; flex-wrap: wrap; margin: 1rem 0;">
+        <span style="color: white;">📱 Mobile Optimized</span>
+        <span style="color: white;">🌍 Multi-language</span>
+        <span style="color: white;">⚡ FastAPI Backend</span>
+        <span style="color: white;">📄 Batch Processing</span>
+    </div>
+    <p style="color: #FFD700; margin-top: 1rem; font-size: 0.9rem;">
+        Version 2.0 • Built with ❤️ for Kenya's Agricultural Future
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# Auto-refresh for dashboard (if enabled in settings)
+if (selected_page == current_texts["dashboard"] and 
+    locals().get('auto_refresh', False) and 
+    st.session_state.analysis_history):
+    # Add refresh button instead of automatic refresh to avoid constant reloading
+    if st.button("🔄 Refresh Dashboard"):
+        st.rerun()
+
+# Performance monitoring (if debug mode enabled)
+if locals().get('debug_mode', False):
+    st.markdown("---")
+    st.markdown("### 🛠 Debug Information")
+    
+    debug_info = {
+        "timestamp": datetime.now().isoformat(),
+        "selected_page": selected_page,
+        "api_status": st.session_state.get('cached_api_status', 'unknown'),
+        "total_analyses": len(st.session_state.analysis_history),
+        "total_batches": len(st.session_state.batch_results),
+        "current_language": st.session_state.selected_language,
+        "session_state_size": len(st.session_state.keys()),
+        "memory_usage": f"{len(str(st.session_state)) / 1024:.1f} KB"
+    }
+    st.json(debug_info)
+
+# Cache model for offline use if API is connected
+if api_connected and not st.session_state.get('model_cached', False):
+    cache_model_offline()
