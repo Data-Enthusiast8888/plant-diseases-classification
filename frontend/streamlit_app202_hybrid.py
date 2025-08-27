@@ -297,8 +297,25 @@ if 'hybrid_metrics' not in st.session_state:
     st.session_state.hybrid_metrics = {'hits':0,'misses':0,'conflicts':0}
 # ===== CONFIGURATION =====
 # Environment variables setup
-os.environ.setdefault("FASTAPI_URL", "http://127.0.0.1:8000")
-os.environ.setdefault("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000")
+
+# os.environ.setdefault("FASTAPI_URL", "http://127.0.0.1:8000")
+# os.environ.setdefault("FASTAPI_PUBLIC_URL", "http://203.0.113.1:8000")
+
+# Dynamically set defaults: LAN + optional public
+LOCAL_IP = None
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))
+    LOCAL_IP = s.getsockname()[0]
+    s.close()
+except:
+    LOCAL_IP = "127.0.0.1"
+
+# Set env vars (LAN preferred)
+os.environ.setdefault("FASTAPI_URL", f"http://{LOCAL_IP}:8000")
+# If you have a domain or public IP, set it in your system env before running
+# Example: export FASTAPI_PUBLIC_URL="https://myserver.com"
+
 
 def get_local_ip():
     """Get local IP address"""
@@ -310,10 +327,9 @@ def get_local_ip():
         return local_ip
     except:
         return "127.0.0.1"
-
+    
 def get_api_url():
-    """Get working FastAPI URL with session state caching"""
-    # Use cached URL if available and still working
+    """Auto-detect FastAPI URL: prefer LAN, then public, fallback to localhost"""
     if 'working_api_url' in st.session_state and st.session_state.working_api_url:
         try:
             resp = requests.get(f"{st.session_state.working_api_url}/health", timeout=2)
@@ -321,19 +337,28 @@ def get_api_url():
                 return st.session_state.working_api_url
         except:
             pass
-    
-    # Test URLs
-    urls_to_try = [
-        os.getenv("FASTAPI_URL"),
-        os.getenv("FASTAPI_PUBLIC_URL"),
-        f"http://{get_local_ip()}:8000",
+
+    # Candidate URLs (LAN first, then public, then local)
+    urls_to_try = []
+
+    # LAN IP
+    lan_ip = get_local_ip()
+    if lan_ip and lan_ip != "127.0.0.1":
+        urls_to_try.append(f"http://{lan_ip}:8000")
+
+    # Public (if set externally)
+    pub_url = os.getenv("FASTAPI_PUBLIC_URL")
+    if pub_url:
+        urls_to_try.append(pub_url)
+
+    # Localhost fallback
+    urls_to_try += [
         "http://127.0.0.1:8000",
         "http://localhost:8000"
     ]
-    
+
+    # Test in order
     for url in urls_to_try:
-        if not url:
-            continue
         try:
             resp = requests.get(f"{url}/health", timeout=3)
             if resp.status_code == 200:
@@ -341,8 +366,42 @@ def get_api_url():
                 return url
         except:
             continue
+
+    return "http://127.0.0.1:8000"  # absolute fallback
+
+
+# def get_api_url():
+#     """Get working FastAPI URL with session state caching"""
+#     # Use cached URL if available and still working
+#     if 'working_api_url' in st.session_state and st.session_state.working_api_url:
+#         try:
+#             resp = requests.get(f"{st.session_state.working_api_url}/health", timeout=2)
+#             if resp.status_code == 200:
+#                 return st.session_state.working_api_url
+#         except:
+#             pass
     
-    return "http://127.0.0.1:8000"  # fallback
+#     # Test URLs
+#     urls_to_try = [
+#         os.getenv("FASTAPI_URL"),
+#         os.getenv("FASTAPI_PUBLIC_URL"),
+#         f"http://{get_local_ip()}:8000",
+#         "http://127.0.0.1:8000",
+#         "http://localhost:8000"
+#     ]
+    
+#     for url in urls_to_try:
+#         if not url:
+#             continue
+#         try:
+#             resp = requests.get(f"{url}/health", timeout=3)
+#             if resp.status_code == 200:
+#                 st.session_state.working_api_url = url
+#                 return url
+#         except:
+#             continue
+    
+#     return "http://127.0.0.1:8000"  # fallback
 
 FASTAPI_BASE_URL = get_api_url()
 
