@@ -784,7 +784,7 @@ PLANT_DISEASES = {
         'treatment': 'Remove infected plants, sanitize tools and hands thoroughly',
         'prevention': 'Use certified virus-free seeds, avoid tobacco use near plants',
         'organic_treatment': 'Complete plant removal, thorough equipment sanitation',
-        'watering_advice': 'Avoid mechanical transmission through contaminated water'
+        'watering_advice': 'Avoid mechanica                                                                                                                                                                                                         l transmission through contaminated water'
     },
     'Tomato___healthy': {
         'name': 'Healthy Tomato', 'plant': 'Nyanya (Tomato)', 'severity': 'None',

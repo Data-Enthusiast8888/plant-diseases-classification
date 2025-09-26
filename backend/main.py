@@ -186,6 +186,7 @@ async def predict_disease(file: UploadFile = File(...)):
         # Read and process image
         logger.info(f"Processing image: {file.filename} (Content-Type: {file.content_type})")
         
+        
         # Read image data
         image_data = await file.read()
         logger.info(f"Read {len(image_data)} bytes from uploaded file")
@@ -401,7 +402,8 @@ if __name__ == "__main__":
     # Run the server
     uvicorn.run(
         "main:app",
-        host="127.0.0.1",
+        #host="127.0.0.0",
+        host="0.0.0.0",  # 👈 Exposes to all devices on the network
         port=8000,
         reload=True,
         log_level="info"
