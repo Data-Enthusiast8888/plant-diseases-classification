@@ -1,0 +1,82 @@
+# ============================
+# 🧠 Kilimoglow AI Project
+# Python + Streamlit + FastAPI + React + Docker
+# ============================
+
+# --- Python cache & compiled files ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual environments ---
+env/
+venv/
+.venv/
+
+# --- Streamlit cache ---
+.streamlit/
+.streamlit/secrets.toml
+
+# --- FastAPI logs & compiled files ---
+*.log
+*.tmp
+*.bak
+
+# --- Model files & checkpoints ---
+models/
+checkpoints/
+*.h5
+*.pt
+*.pkl
+*.ckpt
+
+# --- Data directories ---
+data/
+datasets/
+uploads/
+tmp/
+
+# --- Audio files (English, Kiswahili, Luo) ---
+*.mp3
+*.wav
+*.m4a
+*.flac
+audio/
+voices/
+speech_data/
+
+# --- Environment variables ---
+.env
+*.env
+
+# --- Frontend (React) ---
+frontend/node_modules/
+frontend/build/
+frontend/.env
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints/
+
+# --- Docker ---
+docker-compose.override.yml
+.dockerignore
+
+# --- IDE / Editor configs ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS-specific files ---
+.DS_Store
+Thumbs.db
+
+# --- Reports / Outputs ---
+reports/
+output/
+*.pdf
+*.csv
+
+# --- Test Artifacts ---
+tests/__pycache__/
+tests/tmp/
