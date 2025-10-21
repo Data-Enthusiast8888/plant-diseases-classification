@@ -287,7 +287,8 @@ async def batch_predict(files: list[UploadFile] = File(...)):
             })
             continue
         
-        # More flexible content type checking for batch
+        # More flexible content type checking for 
+        
         if file.content_type and not file.content_type.startswith('image/'):
             results.append({
                 "index": i,

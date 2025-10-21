@@ -1100,6 +1100,7 @@ def display_disease_analysis(result, image=None):
     confidence = result.get("confidence", 0) * 100 if result.get("confidence", 0) <= 1 else result.get("confidence", 0)
     model_version = result.get("model_version", "unknown")
     
+    
     # Get disease information from PLANT_DISEASES
     disease_info = PLANT_DISEASES.get(predicted_class, {
         'name': 'Unknown Disease',
