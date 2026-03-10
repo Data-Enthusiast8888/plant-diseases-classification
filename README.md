@@ -108,14 +108,14 @@ Run frontend:
 cd ../frontend
 streamlit run streamlit_app.py
 
-📱 Example Workflow
+#📱 Example Workflow
 
 1️⃣ Upload plant leaf image
 2️⃣ AI predicts disease
 3️⃣ System returns diagnosis
 4️⃣ Farmer receives recommended action
 
-🌾 Impact
+#🌾 Impact
 
 KilimoGlow aims to support:
 
@@ -133,20 +133,17 @@ Offline inference
 
 Integration with agricultural advisory systems
 
-🧑‍💻 Built For
-
+#🧑‍💻 Built For
 AgriTech CIO × GDG Datathon
 
 A challenge focused on building technology solutions for sustainable agriculture and food security.
 
-👨‍🔬 Maintainer
-
+#👨‍🔬 Maintainer
 Odhiambo Okeyi
 
 Machine learning practitioner building intelligent systems connecting AI, agriculture, and real-world impact.
 
-⭐ Contributing
-
+#⭐ Contributing
 Contributions welcome in:
 
       Agricultural datasets
