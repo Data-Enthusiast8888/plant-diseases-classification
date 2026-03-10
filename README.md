@@ -1,82 +1,110 @@
-# 🌱 Plant Disease Classifier: Potato, Pepper & Tomato
+# 🌱 KilimoGlow – AI Crop Disease Detection
 
-A modular image classification system built for diagnosing **crop diseases** in real-world agricultural settings. With support for **potato**, **pepper**, and **tomato**, this tool bridges robust machine learning with emotionally resonant, field-friendly UX.
+KilimoGlow is an **AI-powered crop disease detection platform** designed to help **smallholder farmers quickly diagnose plant diseases** using a simple smartphone camera.
 
-Whether you're a researcher, extension officer, or developer focused on food security, this repo offers a reproducible, deployable workflow that feels both local and scalable.
-
----
-
-## 🔍 Model Summary
-
-- **Detected Classes**:
-  - *Healthy plants*
-  - *Early & Late Blight, Bacterial Spot, Mosaic Virus* (varying by crop)
-- **Frameworks**:
-  - `TensorFlow` + `Keras`
-  - `FastAPI` for serving
-  - UI: `Streamlit` or `React`
-  - Containerization via `Docker`
+Built for the **AgriTech CIO × GDG Datathon**, the system uses computer vision to analyze plant leaf images and provide **instant disease diagnosis and treatment recommendations**.
 
 ---
 
-## 📁 Repo Structure
+# 🌍 Problem
 
-Here’s how the folders are organized based on your workspace layout:
+Plant diseases cause **up to 40% crop losses globally**, and many farmers lack fast access to agricultural experts.
 
-| Folder/File                   | Description                                                |
-|------------------------------|------------------------------------------------------------|
-| `quick_fix.py`               | Script to auto-create project folders and test model setup |
-| `backend/`                   | FastAPI endpoints for model inference                      |
-| `frontend/`                  | Streamlit/React-based interface for user interaction       |
-| `models/`                    | Directory for trained models and checkpoints               |
-| `main.py`                    | Central script for initializing API or running tests       |
-| `streamlit_app.py`           | Streamlit app entry point                                  |
-| `plant_disease_model.h5`     | Pretrained model weights                                   |
-| `plant_disease_classification.png` | Sample output or visual explainer                          |
-| `requirements.txt`           | Python dependencies for setup                              |
-| `README.md`                  | Project overview and instructions                          |
+In rural areas, diagnosing crop diseases often involves:
+
+- Waiting for extension officers
+- Misidentifying symptoms
+- Applying incorrect treatments
+
+Early detection can significantly **improve yields and reduce losses**.
 
 ---
 
-## 🚀 Quickstart
+# 💡 Solution
+
+KilimoGlow allows farmers to:
+
+1. 📷 Take a photo of a plant leaf  
+2. 🤖 AI analyzes the image  
+3. 🔎 Detect the disease  
+4. 🌿 Receive simple treatment recommendations  
+
+The system focuses on **practical field usability** with a simple and intuitive interface.
+
+---
+
+# 🧠 Model Capabilities
+
+Supported crops:
+
+- 🌽 Potato
+- 🌶 Pepper
+- 🍅 Tomato
+
+Detected conditions include:
+
+- Healthy plants
+- Early Blight
+- Late Blight
+- Bacterial Spot
+- Mosaic Virus
+
+Built with:
+
+- **TensorFlow / Keras**
+- **FastAPI**
+- **Streamlit / React**
+- **Docker**
+
+---
+
+# 🏗 System Architecture
+
+Leaf Image
+↓
+Frontend (Streamlit / React)
+↓
+FastAPI Backend
+↓
+Deep Learning Model
+↓
+Prediction + Treatment Recommendation
+
+
+---
+
+# 📁 Project Structure
+
+| Folder | Description |
+|------|-------------|
+| `backend/` | FastAPI service for model inference |
+| `frontend/` | Streamlit or React interface |
+| `models/` | Trained model files |
+| `main.py` | API initialization |
+| `streamlit_app.py` | Frontend demo application |
+| `requirements.txt` | Python dependencies |
+
+---
+
+# 🚀 Running the Project
+
+Clone the repository:
 
 ```bash
-# Clone the repo
 git clone https://github.com/Data-Enthusiast8888/plant-diseases-classification.git
+cd plant-diseases-classification
 
-# Run quick setup script
-python quick_fix.py
+Install dependencies:
+pip install -r requirements.txt
 
-# Start backend (FastAPI)
+Run backend:
+
 cd backend
 uvicorn main:app --reload
 
-# Launch frontend (Streamlit)
+
+Run frontend:
+
 cd ../frontend
 streamlit run streamlit_app.py
 
-🌍 Why It Matters
-Crop diseases silently undermine yields. This tool empowers users to detect issues early, with an interface that feels grounded, multilingual, and emotionally intuitive.
-
-Use Cases:
-    🌾 Field diagnosis for extension officers
-    
-    📱 Mobile dashboards for farmers
-    
-    🔬 Prototyping new AI-agronomy models
-
-🤝 Contribute & Collaborate
-Looking to grow with:
-
-      -Local image datasets or disease labels
-      
-      -UX additions in Kiswahili or other languages
-      
-      -Model benchmarking & confidence scoring
-      
-      -Engaged policy conversations around agricultural tech
-
-Let’s make the invisible visible—and intelligible.
-
-📬 Maintainer
-Crafted by Odhiambo Okeyi, intelligent systems designer blending machine learning, local empathy, and narrative clarity.
