@@ -108,3 +108,51 @@ Run frontend:
 cd ../frontend
 streamlit run streamlit_app.py
 
+📱 Example Workflow
+
+1️⃣ Upload plant leaf image
+2️⃣ AI predicts disease
+3️⃣ System returns diagnosis
+4️⃣ Farmer receives recommended action
+
+🌾 Impact
+
+KilimoGlow aims to support:
+
+Smallholder farmers
+
+Agricultural extension officers
+
+AgriTech innovators
+
+Future improvements include:
+
+Kiswahili language support
+
+Offline inference
+
+Integration with agricultural advisory systems
+
+🧑‍💻 Built For
+
+AgriTech CIO × GDG Datathon
+
+A challenge focused on building technology solutions for sustainable agriculture and food security.
+
+👨‍🔬 Maintainer
+
+Odhiambo Okeyi
+
+Machine learning practitioner building intelligent systems connecting AI, agriculture, and real-world impact.
+
+⭐ Contributing
+
+Contributions welcome in:
+
+      Agricultural datasets
+      
+      Model improvements
+      
+      UI enhancements
+      
+      Multilingual support
