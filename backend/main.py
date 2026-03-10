@@ -58,7 +58,7 @@ def load_model():
     global model
     try:
         # Replace with your actual model path
-        model_path = "models/plant_disease_model.h5"  # or .keras
+        model_path = "backend/models/plant_disease_model.h5"  # or .keras
         
         # Clear any existing sessions
         tf.keras.backend.clear_session()
